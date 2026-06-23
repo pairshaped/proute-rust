@@ -25,7 +25,9 @@ Rules:
 - GET is the default.
 - `create.rs`, `update.rs`, and `delete.rs` are reserved mutation endpoints.
 - `index.rs` owns the current directory path. At the mount root, it owns `/`.
-- `not_found_.rs` owns the mount 404 route.
+- `not_found_.rs` is optional. When present, it owns the mount 404 route.
+- `Route::NotFound` is always generated as the parser fallback, even without a
+  `not_found_.rs` page file.
 - `all_.rs` is reserved for future catch-all routing.
 - `mod.rs` and every `shared/` directory are ignored.
 - `show.rs` is rejected. Use `orders/order_id_/index.rs`.
