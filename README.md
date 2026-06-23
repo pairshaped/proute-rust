@@ -8,13 +8,14 @@ then adds a small server-side convention for HTTP mutation endpoints.
 ## Route Convention
 
 ```text
-orders.rs                  -> GET    /orders
-orders/new.rs              -> GET    /orders/new
-orders/create.rs           -> POST   /orders
-orders/order_id_.rs        -> GET    /orders/{order_id}
-orders/order_id_/edit.rs   -> GET    /orders/{order_id}/edit
-orders/order_id_/update.rs -> POST   /orders/{order_id}
-orders/order_id_/delete.rs -> DELETE /orders/{order_id}
+index.rs                       -> GET    /
+orders/index.rs                -> GET    /orders
+orders/new.rs                  -> GET    /orders/new
+orders/create.rs               -> POST   /orders
+orders/order_id_/index.rs      -> GET    /orders/{order_id}
+orders/order_id_/edit.rs       -> GET    /orders/{order_id}/edit
+orders/order_id_/update.rs     -> POST   /orders/{order_id}
+orders/order_id_/delete.rs     -> DELETE /orders/{order_id}
 ```
 
 Rules:
@@ -23,12 +24,13 @@ Rules:
 - Trailing underscores mark dynamic path params.
 - GET is the default.
 - `create.rs`, `update.rs`, and `delete.rs` are reserved mutation endpoints.
-- `home_.rs` owns the mount root.
+- `index.rs` owns the current directory path. At the mount root, it owns `/`.
 - `not_found_.rs` owns the mount 404 route.
 - `all_.rs` is reserved for future catch-all routing.
 - `mod.rs` and every `shared/` directory are ignored.
-- `index.rs` and `show.rs` are rejected. The file itself is the page:
-  use `orders.rs` and `orders/order_id_.rs`.
+- `show.rs` is rejected. Use `orders/order_id_/index.rs`.
+- A route file cannot also be a namespace parent. If `orders/` exists, use
+  `orders/index.rs` instead of `orders.rs`.
 - `create`, `update`, and `delete` cannot be used as intermediate path
   segments. They are action files only.
 
