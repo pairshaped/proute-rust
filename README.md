@@ -78,6 +78,9 @@ Each routable module exposes a `handler` function by default:
 pub(crate) async fn handler(...) -> impl IntoResponse
 ```
 
+`proute` validates this during discovery. The handler may be `pub(crate)` or
+`pub`, and may be `async` or sync.
+
 The mount can override that name:
 
 ```rust
