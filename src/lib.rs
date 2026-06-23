@@ -419,9 +419,11 @@ pub fn generate_mount_module(mount_routes: &MountRoutes) -> String {
     sections.push(generated_header(mount_routes));
     sections.push(route_spec_type());
     sections.push(route_enum(mount_routes));
+    sections.push(parsed_request_type(mount_routes));
     sections.push(route_table(mount_routes));
     sections.push(router_functions(mount_routes));
     sections.push(parse_request(mount_routes));
+    sections.push(parse_localized_request(mount_routes));
     sections.push(route_to_path(mount_routes));
     sections.push(route_to_prefixed_path(mount_routes));
     sections.push(route_to_localized_path(mount_routes));
@@ -476,6 +478,16 @@ fn route_enum(mount_routes: &MountRoutes) -> String {
     format!(
         "#[derive(Clone, Debug, Eq, PartialEq)]\npub enum Route {{\n{}\n}}\n",
         indent_lines(&variants, 4)
+    )
+}
+
+fn parsed_request_type(mount_routes: &MountRoutes) -> String {
+    let Some(language_param) = mount_routes.mount.language_param.as_deref() else {
+        return String::new();
+    };
+
+    format!(
+        "#[derive(Clone, Debug, Eq, PartialEq)]\npub struct ParsedRequest {{\n    pub route: Route,\n    pub {language_param}: Option<String>,\n}}\n"
     )
 }
 
@@ -549,14 +561,59 @@ fn parse_request(mount_routes: &MountRoutes) -> String {
         r#"pub fn parse_request(method: &str, raw_path: &str) -> Route {{
     let path = raw_path.split(['?', '#']).next().unwrap_or(raw_path);
     let segments = path_segments(path);
+    parse_segments(method, segments.as_slice())
+}}
 
-    match (method, segments.as_slice()) {{
+fn parse_segments(method: &str, segments: &[&str]) -> Route {{
+    match (method, segments) {{
 {}
         _ => Route::NotFound,
     }}
 }}
 "#,
         indent_lines(&cases, 8)
+    )
+}
+
+fn parse_localized_request(mount_routes: &MountRoutes) -> String {
+    let Some(language_param) = mount_routes.mount.language_param.as_deref() else {
+        return String::new();
+    };
+
+    format!(
+        r#"pub fn parse_localized_request(method: &str, raw_path: &str) -> ParsedRequest {{
+    let path = raw_path.split(['?', '#']).next().unwrap_or(raw_path);
+    let segments = path_segments(path);
+    let canonical = parse_segments(method, segments.as_slice());
+
+    if canonical != Route::NotFound {{
+        return ParsedRequest {{
+            route: canonical,
+            {language_param}: None,
+        }};
+    }}
+
+    match segments.as_slice() {{
+        [{language_param}, rest @ ..] => {{
+            let Some({language_param}) = percent_decode({language_param}) else {{
+                return ParsedRequest {{
+                    route: Route::NotFound,
+                    {language_param}: None,
+                }};
+            }};
+            let route = parse_segments(method, rest);
+            ParsedRequest {{
+                route,
+                {language_param}: Some({language_param}),
+            }}
+        }}
+        _ => ParsedRequest {{
+            route: parse_segments(method, segments.as_slice()),
+            {language_param}: None,
+        }},
+    }}
+}}
+"#
     )
 }
 
@@ -1629,7 +1686,7 @@ mod tests {
         fixture.write("not_found_.rs");
         fixture.write("orders/order_id_.rs");
 
-        let mount_routes = discover_mount(fixture.mount()).unwrap();
+        let mount_routes = discover_mount(fixture.mount().with_language_param("lang")).unwrap();
         let generated = generate_mount_file(&mount_routes);
 
         assert_eq!(generated.path, PathBuf::from("routes/public.rs"));
@@ -1768,7 +1825,7 @@ mod tests {
         fixture.write("orders/create.rs");
         fixture.write("orders/order_id_.rs");
 
-        let mount_routes = discover_mount(fixture.mount()).unwrap();
+        let mount_routes = discover_mount(fixture.mount().with_language_param("lang")).unwrap();
         let source_path = fixture.root.join("generated_parser.rs");
         fs::write(
             &source_path,
@@ -2223,6 +2280,36 @@ fn main() {{
     );
     assert_eq!(parse_request("DELETE", "/orders/a%2Fb"), Route::NotFound);
     assert_eq!(parse_request("GET", "/orders/%GG"), Route::NotFound);
+    assert_eq!(
+        parse_localized_request("GET", "/orders"),
+        ParsedRequest {{
+            route: Route::Orders,
+            lang: None,
+        }}
+    );
+    assert_eq!(
+        parse_localized_request("GET", "/fr/orders/a%2Fb?tab=details"),
+        ParsedRequest {{
+            route: Route::OrdersOrderId {{
+                order_id: "a/b".to_string(),
+            }},
+            lang: Some("fr".to_string()),
+        }}
+    );
+    assert_eq!(
+        parse_localized_request("POST", "/fr/orders"),
+        ParsedRequest {{
+            route: Route::OrdersCreate,
+            lang: Some("fr".to_string()),
+        }}
+    );
+    assert_eq!(
+        parse_localized_request("GET", "/%GG/orders"),
+        ParsedRequest {{
+            route: Route::NotFound,
+            lang: None,
+        }}
+    );
 }}
 "#
         )
