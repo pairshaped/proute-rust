@@ -125,3 +125,17 @@ slashes stay inside a param.
 
 Generated path helpers percent-encode dynamic params, so a value like `a/b`
 round-trips as `/orders/a%2Fb`.
+
+For mounts with a language param, generated modules also expose:
+
+```rust
+pub struct ParsedRequest {
+    pub route: Route,
+    pub lang: Option<String>,
+}
+
+pub fn parse_localized_request(method: &str, raw_path: &str) -> ParsedRequest
+```
+
+Localized parsing tries the canonical path first. `/orders` returns
+`lang: None`, while `/fr/orders` returns `lang: Some("fr")`.
