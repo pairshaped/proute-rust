@@ -15,7 +15,7 @@ orders/create.rs               -> POST   /orders
 orders/order_id_/index.rs      -> GET    /orders/{order_id}
 orders/order_id_/edit.rs       -> GET    /orders/{order_id}/edit
 orders/order_id_/update.rs     -> POST   /orders/{order_id}
-orders/order_id_/delete.rs     -> DELETE /orders/{order_id}
+orders/order_id_/delete.rs     -> POST   /orders/{order_id}/delete
 ```
 
 Rules:

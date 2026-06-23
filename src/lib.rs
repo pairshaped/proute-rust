@@ -1179,15 +1179,17 @@ fn endpoint_for(raw_segments: &[String]) -> Endpoint {
 fn method_for(endpoint: &Endpoint) -> HttpMethod {
     match endpoint {
         Endpoint::Page => HttpMethod::Get,
-        Endpoint::Action(Action::Create | Action::Update) => HttpMethod::Post,
-        Endpoint::Action(Action::Delete) => HttpMethod::Delete,
+        Endpoint::Action(Action::Create | Action::Update | Action::Delete) => HttpMethod::Post,
     }
 }
 
 fn route_segments(raw_segments: &[String], endpoint: &Endpoint) -> Vec<RouteSegment> {
     let path_segments = match endpoint {
         Endpoint::Page => raw_segments,
-        Endpoint::Action(_) => &raw_segments[..raw_segments.len() - 1],
+        Endpoint::Action(Action::Create | Action::Update) => {
+            &raw_segments[..raw_segments.len() - 1]
+        }
+        Endpoint::Action(Action::Delete) => raw_segments,
     };
     let path_segments = match path_segments.last().map(String::as_str) {
         Some("index") => &path_segments[..path_segments.len() - 1],
@@ -1744,7 +1746,7 @@ mod tests {
                 "GET /orders/new OrdersNew crate::pages::orders::new",
                 "GET /orders/{order_id} OrdersOrderId crate::pages::orders::order_id_::index",
                 "POST /orders/{order_id} OrdersOrderIdUpdate crate::pages::orders::order_id_::update",
-                "DELETE /orders/{order_id} OrdersOrderIdDelete crate::pages::orders::order_id_::delete",
+                "POST /orders/{order_id}/delete OrdersOrderIdDelete crate::pages::orders::order_id_::delete",
                 "GET /orders/{order_id}/edit OrdersOrderIdEdit crate::pages::orders::order_id_::edit",
                 "GET /not_found NotFound crate::pages::not_found_",
             ]
@@ -1985,8 +1987,14 @@ mod tests {
                 .contains(".route(\"/orders\", axum::routing::get(crate::pages::orders::index::handler).post(crate::pages::orders::create::handler))")
         );
         assert!(
-            generated
-                .contains(".route(\"/orders/{order_id}\", axum::routing::get(crate::pages::orders::order_id_::index::handler).post(crate::pages::orders::order_id_::update::handler).delete(crate::pages::orders::order_id_::delete::handler))")
+            generated.contains(
+                ".route(\"/orders/{order_id}\", axum::routing::get(crate::pages::orders::order_id_::index::handler).post(crate::pages::orders::order_id_::update::handler))"
+            )
+        );
+        assert!(
+            generated.contains(
+                ".route(\"/orders/{order_id}/delete\", axum::routing::post(crate::pages::orders::order_id_::delete::handler))"
+            )
         );
         assert!(
             generated
@@ -2210,7 +2218,7 @@ mod tests {
                 "GET /orders/new crate::pages::orders::new::new",
                 "GET /orders/{order_id} crate::pages::orders::order_id_::index::index",
                 "POST /orders/{order_id} crate::pages::orders::order_id_::update::update",
-                "DELETE /orders/{order_id} crate::pages::orders::order_id_::delete::delete",
+                "POST /orders/{order_id}/delete crate::pages::orders::order_id_::delete::delete",
                 "GET /orders/{order_id}/edit crate::pages::orders::order_id_::edit::edit",
                 "GET /not_found crate::pages::not_found_::not_found",
             ]
