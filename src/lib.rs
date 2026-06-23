@@ -1460,17 +1460,43 @@ fn has_public_handler(source: &str, handler_name: &str) -> bool {
 }
 
 fn public_fn_declarations(source: &str) -> Vec<String> {
-    source
+    let mut declarations = Vec::new();
+    let mut current = String::new();
+
+    for line in source
         .lines()
         .map(strip_line_comment)
-        .map(str::trim)
-        .filter(|line| line.starts_with("pub"))
-        .map(normalize_whitespace)
-        .collect()
+        .map(|line| line.trim().to_string())
+    {
+        if line.is_empty() || line.starts_with("#[") {
+            continue;
+        }
+
+        if current.is_empty() {
+            if !line.starts_with("pub") {
+                continue;
+            }
+            current.push_str(&line);
+        } else {
+            current.push(' ');
+            current.push_str(&line);
+        }
+
+        if line.contains('{') || line.contains(';') {
+            declarations.push(normalize_whitespace(&current));
+            current.clear();
+        }
+    }
+
+    if !current.is_empty() {
+        declarations.push(normalize_whitespace(&current));
+    }
+
+    declarations
 }
 
-fn strip_line_comment(line: &str) -> &str {
-    line.split("//").next().unwrap_or(line)
+fn strip_line_comment(line: &str) -> String {
+    line.split("//").next().unwrap_or(line).to_string()
 }
 
 fn normalize_whitespace(value: &str) -> String {
@@ -1926,6 +1952,27 @@ mod tests {
             .routes;
 
         assert_eq!(routes[1].handler_path, "crate::pages::orders::route");
+    }
+
+    #[test]
+    fn validates_multiline_handler_declarations() {
+        let fixture = Fixture::new("multiline_handler");
+        fixture.write("home_.rs");
+        fixture.write("not_found_.rs");
+        fixture.write_source(
+            "orders.rs",
+            r#"
+#[allow(dead_code)]
+pub(crate) async fn handler(
+    state: (),
+) {
+}
+"#,
+        );
+
+        let routes = discover_mount(fixture.mount()).unwrap().routes;
+
+        assert_eq!(routes[1].handler_path, "crate::pages::orders::handler");
     }
 
     #[test]
