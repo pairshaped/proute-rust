@@ -119,3 +119,6 @@ POST /orders -> Route::OrdersCreate
 
 Dynamic path params are percent-decoded after path segmentation, so encoded
 slashes stay inside a param.
+
+Generated path helpers percent-encode dynamic params, so a value like `a/b`
+round-trips as `/orders/a%2Fb`.

@@ -410,6 +410,7 @@ pub fn generate_mount_module(mount_routes: &MountRoutes) -> String {
     sections.push(route_to_localized_url(mount_routes));
     sections.push(path_helpers(mount_routes));
     sections.push(path_segments_function());
+    sections.push(percent_encode_function());
     sections.push(percent_decode_function());
     sections.push(trim_trailing_slash());
 
@@ -812,6 +813,31 @@ fn path_segments_function() -> String {
     .to_string()
 }
 
+fn percent_encode_function() -> String {
+    r#"fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+
+    for byte in value.bytes() {
+        if is_unreserved(byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+
+    encoded
+}
+
+fn is_unreserved(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+    )
+}
+"#
+    .to_string()
+}
+
 fn percent_decode_function() -> String {
     r#"fn percent_decode(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
@@ -886,7 +912,13 @@ fn path_expression_from_template(path: &str) -> String {
         .collect::<Vec<_>>()
         .join("/");
 
-    format!("format!({template:?}, {})", params.join(", "))
+    let encoded_params = params
+        .iter()
+        .map(|param| format!("percent_encode(&{param}.to_string())"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("format!({template:?}, {encoded_params})")
 }
 
 fn prefixed_route_path(mount: &Mount, path: &str) -> Option<String> {
@@ -1520,7 +1552,7 @@ mod tests {
         assert!(
             generated
                 .contents
-                .contains("format!(\"/orders/{}\", order_id)")
+                .contains("format!(\"/orders/{}\", percent_encode(&order_id.to_string()))")
         );
     }
 
@@ -1556,11 +1588,15 @@ mod tests {
                 .contents
                 .contains("pub fn route_to_localized_path(route: &Route, lang: &str, primary_lang: &str) -> String")
         );
-        assert!(generated.contents.contains("format!(\"/{}/orders\", lang)"));
         assert!(
             generated
                 .contents
-                .contains("format!(\"/{}/orders/{}\", lang, order_id)")
+                .contains("format!(\"/{}/orders\", percent_encode(&lang.to_string()))")
+        );
+        assert!(
+            generated
+                .contents
+                .contains("format!(\"/{}/orders/{}\", percent_encode(&lang.to_string()), percent_encode(&order_id.to_string()))")
         );
     }
 
@@ -2027,6 +2063,12 @@ fn main() {{
         Route::OrdersOrderId {{
             order_id: "a/b".to_string(),
         }}
+    );
+    assert_eq!(
+        route_to_path(&Route::OrdersOrderId {{
+            order_id: "a/b".to_string(),
+        }}),
+        "/orders/a%2Fb".to_string()
     );
     assert_eq!(parse_request("DELETE", "/orders/a%2Fb"), Route::NotFound);
     assert_eq!(parse_request("GET", "/orders/%GG"), Route::NotFound);
