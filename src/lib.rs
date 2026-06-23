@@ -10,6 +10,8 @@ pub struct Mount {
     pub route_root: String,
     pub module_root: String,
     pub language_param: Option<String>,
+    pub handler_name: String,
+    pub router_state_type: Option<String>,
 }
 
 impl Mount {
@@ -25,11 +27,23 @@ impl Mount {
             route_root: route_root.into(),
             module_root: module_root.into(),
             language_param: None,
+            handler_name: "handler".to_string(),
+            router_state_type: None,
         }
     }
 
     pub fn with_language_param(mut self, language_param: impl Into<String>) -> Self {
         self.language_param = Some(language_param.into());
+        self
+    }
+
+    pub fn with_handler_name(mut self, handler_name: impl Into<String>) -> Self {
+        self.handler_name = handler_name.into();
+        self
+    }
+
+    pub fn with_router_state_type(mut self, router_state_type: impl Into<String>) -> Self {
+        self.router_state_type = Some(router_state_type.into());
         self
     }
 }
@@ -52,6 +66,7 @@ pub struct Route {
     pub params: Vec<RouteParam>,
     pub source_file: PathBuf,
     pub module_path: String,
+    pub handler_path: String,
 }
 
 impl Route {
@@ -252,6 +267,12 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
             mount_name: mount.name.clone(),
         });
     }
+    if !is_valid_label(&mount.handler_name) {
+        return Err(DiscoverError::InvalidRouteName {
+            source_file: mount.pages.clone(),
+            name: mount.handler_name.clone(),
+        });
+    }
 
     let files = walk_pages(&mount.pages)?;
     let mut routes = Vec::new();
@@ -380,6 +401,7 @@ pub fn generate_mount_module(mount_routes: &MountRoutes) -> String {
     sections.push(route_spec_type());
     sections.push(route_enum(mount_routes));
     sections.push(route_table(mount_routes));
+    sections.push(router_functions(mount_routes));
     sections.push(route_to_path(mount_routes));
     sections.push(route_to_prefixed_path(mount_routes));
     sections.push(route_to_localized_path(mount_routes));
@@ -414,6 +436,7 @@ pub struct RouteSpec {
     pub name: &'static str,
     pub helper_name: &'static str,
     pub module_path: &'static str,
+    pub handler_path: &'static str,
 }
 "#
     .to_string()
@@ -453,13 +476,14 @@ fn route_table(mount_routes: &MountRoutes) -> String {
         .iter()
         .map(|route| {
             format!(
-                "RouteSpec {{ method: {:?}, path: {:?}, prefixed_path: {}, name: {:?}, helper_name: {:?}, module_path: {:?} }},",
+                "RouteSpec {{ method: {:?}, path: {:?}, prefixed_path: {}, name: {:?}, helper_name: {:?}, module_path: {:?}, handler_path: {:?} }},",
                 route.method.to_string(),
                 route.path,
                 optional_string_literal(prefixed_route_path(&mount_routes.mount, &route.path).as_deref()),
                 route.name,
                 route.helper_name,
-                route.module_path
+                route.module_path,
+                route.handler_path
             )
         })
         .collect::<Vec<_>>()
@@ -469,6 +493,105 @@ fn route_table(mount_routes: &MountRoutes) -> String {
         "pub const ROUTES: &[RouteSpec] = &[\n{}\n];\n",
         indent_lines(&specs, 4)
     )
+}
+
+fn router_functions(mount_routes: &MountRoutes) -> String {
+    let Some(state_type) = mount_routes.mount.router_state_type.as_deref() else {
+        return String::new();
+    };
+
+    let canonical = router_function("routes", state_type, &route_groups(mount_routes, false));
+    if mount_routes.mount.language_param.is_none() {
+        return canonical;
+    }
+
+    let prefixed = router_function(
+        "prefixed_routes",
+        state_type,
+        &route_groups(mount_routes, true),
+    );
+
+    format!("{canonical}\n{prefixed}")
+}
+
+fn router_function(name: &str, state_type: &str, groups: &[RouteGroup]) -> String {
+    let routes = groups
+        .iter()
+        .map(route_group_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "pub fn {name}() -> axum::Router<{state_type}> {{\n    axum::Router::new()\n{}\n}}\n",
+        indent_lines(&routes, 8)
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RouteGroup {
+    path: String,
+    routes: Vec<Route>,
+}
+
+fn route_groups(mount_routes: &MountRoutes, prefixed: bool) -> Vec<RouteGroup> {
+    let mut groups: BTreeMap<String, Vec<Route>> = BTreeMap::new();
+
+    for route in &mount_routes.routes {
+        let path = if prefixed {
+            prefixed_route_path(&mount_routes.mount, &route.path)
+                .unwrap_or_else(|| route.path.clone())
+        } else {
+            route.path.clone()
+        };
+
+        groups.entry(path).or_default().push(route.clone());
+    }
+
+    groups
+        .into_iter()
+        .map(|(path, routes)| RouteGroup { path, routes })
+        .collect()
+}
+
+fn route_group_line(group: &RouteGroup) -> String {
+    format!(
+        ".route({:?}, {})",
+        group.path,
+        method_router_expression(&group.routes)
+    )
+}
+
+fn method_router_expression(routes: &[Route]) -> String {
+    let mut routes = routes.to_vec();
+    routes.sort_by_key(|route| route.method);
+
+    let mut iter = routes.into_iter();
+    let first = iter
+        .next()
+        .expect("route group must contain at least one route");
+    let mut expression = format!(
+        "axum::routing::{}({})",
+        method_router_fn(first.method),
+        first.handler_path
+    );
+
+    for route in iter {
+        expression.push_str(&format!(
+            ".{}({})",
+            method_router_fn(route.method),
+            route.handler_path
+        ));
+    }
+
+    expression
+}
+
+fn method_router_fn(method: HttpMethod) -> &'static str {
+    match method {
+        HttpMethod::Get => "get",
+        HttpMethod::Post => "post",
+        HttpMethod::Delete => "delete",
+    }
 }
 
 fn route_to_path(mount_routes: &MountRoutes) -> String {
@@ -747,6 +870,8 @@ fn route_from_file(mount: &Mount, source_file: &Path) -> Result<Route, DiscoverE
         });
     }
 
+    let handler_path = format!("{module_path}::{}", mount.handler_name);
+
     Ok(Route {
         kind: route_kind(&route_segments),
         method: method_for(&endpoint),
@@ -757,6 +882,7 @@ fn route_from_file(mount: &Mount, source_file: &Path) -> Result<Route, DiscoverE
         params,
         source_file: source_file.to_path_buf(),
         module_path,
+        handler_path,
         name,
     })
 }
@@ -887,6 +1013,7 @@ fn pattern_path(path: &str) -> String {
 
 fn not_found_route(mount: &Mount, source_file: &Path, module_path: String) -> Route {
     let segments = vec![RouteSegment::Static("not_found".to_string())];
+    let handler_path = format!("{module_path}::{}", mount.handler_name);
 
     Route {
         kind: RouteKind::NotFound,
@@ -899,6 +1026,7 @@ fn not_found_route(mount: &Mount, source_file: &Path, module_path: String) -> Ro
         params: Vec::new(),
         source_file: source_file.to_path_buf(),
         module_path,
+        handler_path,
     }
 }
 
@@ -1341,6 +1469,81 @@ mod tests {
     }
 
     #[test]
+    fn generated_router_module_compiles_with_stub_axum() {
+        let fixture = Fixture::new("generated_router_compiles");
+        fixture.write("home_.rs");
+        fixture.write("not_found_.rs");
+        fixture.write("orders.rs");
+        fixture.write("orders/create.rs");
+        fixture.write("orders/order_id_.rs");
+        fixture.write("orders/order_id_/update.rs");
+        fixture.write("orders/order_id_/delete.rs");
+
+        let mount = fixture
+            .mount()
+            .with_language_param("lang")
+            .with_router_state_type("crate::app::AppState");
+        let mount_routes = discover_mount(mount).unwrap();
+        let generated = generate_mount_module(&mount_routes);
+        let source_path = fixture.root.join("generated_router.rs");
+        fs::write(&source_path, generated_router_compile_wrapper(&generated)).unwrap();
+
+        let output = std::process::Command::new("rustc")
+            .arg("--edition=2024")
+            .arg("--crate-type=lib")
+            .arg(&source_path)
+            .arg("-o")
+            .arg(fixture.root.join("generated_router.rlib"))
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "generated router module did not compile\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn generated_router_groups_handlers_by_path() {
+        let fixture = Fixture::new("generated_router_groups");
+        fixture.write("home_.rs");
+        fixture.write("not_found_.rs");
+        fixture.write("orders.rs");
+        fixture.write("orders/create.rs");
+        fixture.write("orders/order_id_.rs");
+        fixture.write("orders/order_id_/update.rs");
+        fixture.write("orders/order_id_/delete.rs");
+
+        let mount_routes = discover_mount(
+            fixture
+                .mount()
+                .with_language_param("lang")
+                .with_router_state_type("crate::app::AppState"),
+        )
+        .unwrap();
+        let generated = generate_mount_module(&mount_routes);
+
+        assert!(generated.contains("pub fn routes() -> axum::Router<crate::app::AppState>"));
+        assert!(
+            generated.contains("pub fn prefixed_routes() -> axum::Router<crate::app::AppState>")
+        );
+        assert!(
+            generated
+                .contains(".route(\"/orders\", axum::routing::get(crate::pages::orders::handler).post(crate::pages::orders::create::handler))")
+        );
+        assert!(
+            generated
+                .contains(".route(\"/orders/{order_id}\", axum::routing::get(crate::pages::orders::order_id_::handler).post(crate::pages::orders::order_id_::update::handler).delete(crate::pages::orders::order_id_::delete::handler))")
+        );
+        assert!(
+            generated
+                .contains(".route(\"/{lang}/orders\", axum::routing::get(crate::pages::orders::handler).post(crate::pages::orders::create::handler))")
+        );
+    }
+
+    #[test]
     fn write_mount_file_writes_under_routes_directory() {
         let fixture = Fixture::new("write_mount_file");
         fixture.write("home_.rs");
@@ -1553,5 +1756,91 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, "").unwrap();
+    }
+
+    fn generated_router_compile_wrapper(generated: &str) -> String {
+        format!(
+            r#"
+mod axum {{
+    use std::marker::PhantomData;
+
+    pub struct Router<T>(PhantomData<T>);
+
+    impl<T> Router<T> {{
+        pub fn new() -> Self {{
+            Self(PhantomData)
+        }}
+
+        pub fn route(self, _path: &str, _method_router: routing::MethodRouter<T>) -> Self {{
+            self
+        }}
+    }}
+
+    pub mod routing {{
+        use std::marker::PhantomData;
+
+        pub struct MethodRouter<T>(PhantomData<T>);
+
+        impl<T> MethodRouter<T> {{
+            pub fn post<H>(self, _handler: H) -> Self {{
+                self
+            }}
+
+            pub fn delete<H>(self, _handler: H) -> Self {{
+                self
+            }}
+        }}
+
+        pub fn get<T, H>(_handler: H) -> MethodRouter<T> {{
+            MethodRouter(PhantomData)
+        }}
+
+        pub fn post<T, H>(_handler: H) -> MethodRouter<T> {{
+            MethodRouter(PhantomData)
+        }}
+
+        pub fn delete<T, H>(_handler: H) -> MethodRouter<T> {{
+            MethodRouter(PhantomData)
+        }}
+    }}
+}}
+
+mod app {{
+    pub struct AppState;
+}}
+
+mod pages {{
+    pub mod home_ {{
+        pub async fn handler() {{}}
+    }}
+
+    pub mod not_found_ {{
+        pub async fn handler() {{}}
+    }}
+
+    pub mod orders {{
+        pub async fn handler() {{}}
+
+        pub mod create {{
+            pub async fn handler() {{}}
+        }}
+
+        pub mod order_id_ {{
+            pub async fn handler() {{}}
+
+            pub mod update {{
+                pub async fn handler() {{}}
+            }}
+
+            pub mod delete {{
+                pub async fn handler() {{}}
+            }}
+        }}
+    }}
+}}
+
+{generated}
+"#
+        )
     }
 }
