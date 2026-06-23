@@ -402,12 +402,15 @@ pub fn generate_mount_module(mount_routes: &MountRoutes) -> String {
     sections.push(route_enum(mount_routes));
     sections.push(route_table(mount_routes));
     sections.push(router_functions(mount_routes));
+    sections.push(parse_request(mount_routes));
     sections.push(route_to_path(mount_routes));
     sections.push(route_to_prefixed_path(mount_routes));
     sections.push(route_to_localized_path(mount_routes));
     sections.push(route_to_url());
     sections.push(route_to_localized_url(mount_routes));
     sections.push(path_helpers(mount_routes));
+    sections.push(path_segments_function());
+    sections.push(percent_decode_function());
     sections.push(trim_trailing_slash());
 
     sections.join("\n")
@@ -512,6 +515,85 @@ fn router_functions(mount_routes: &MountRoutes) -> String {
     );
 
     format!("{canonical}\n{prefixed}")
+}
+
+fn parse_request(mount_routes: &MountRoutes) -> String {
+    let cases = mount_routes
+        .routes
+        .iter()
+        .map(parse_request_case)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"pub fn parse_request(method: &str, raw_path: &str) -> Route {{
+    let path = raw_path.split(['?', '#']).next().unwrap_or(raw_path);
+    let segments = path_segments(path);
+
+    match (method, segments.as_slice()) {{
+{}
+        _ => Route::NotFound,
+    }}
+}}
+"#,
+        indent_lines(&cases, 8)
+    )
+}
+
+fn parse_request_case(route: &Route) -> String {
+    let pattern = parse_segment_pattern(route);
+    if route.params.is_empty() {
+        format!(
+            "({:?}, {pattern}) => Route::{},",
+            route.method.to_string(),
+            route.name
+        )
+    } else {
+        let decoders = parse_dynamic_decoders(route);
+        format!(
+            "({:?}, {pattern}) => {{\n{}\n        }},",
+            route.method.to_string(),
+            indent_lines(&decoders, 12)
+        )
+    }
+}
+
+fn parse_segment_pattern(route: &Route) -> String {
+    if route.segments.is_empty() {
+        return "[]".to_string();
+    }
+
+    let segments = route
+        .segments
+        .iter()
+        .map(|segment| match segment {
+            RouteSegment::Static(value) => format!("{value:?}"),
+            RouteSegment::Dynamic(name) => name.as_str().to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("[{segments}]")
+}
+
+fn parse_dynamic_decoders(route: &Route) -> String {
+    let mut lines = Vec::new();
+    for param in &route.params {
+        lines.push(format!(
+            "let Some({}) = percent_decode({}) else {{ return Route::NotFound; }};",
+            param.name, param.name
+        ));
+    }
+
+    let fields = route
+        .params
+        .iter()
+        .map(|param| format!("{}: {}", param.name, param.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    lines.push(format!("Route::{} {{ {} }}", route.name, fields));
+    lines.join("\n")
 }
 
 fn router_function(name: &str, state_type: &str, groups: &[RouteGroup]) -> String {
@@ -717,6 +799,50 @@ fn path_helpers(mount_routes: &MountRoutes) -> String {
         .map(path_helper)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn path_segments_function() -> String {
+    r#"fn path_segments(path: &str) -> Vec<&str> {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+"#
+    .to_string()
+}
+
+fn percent_decode_function() -> String {
+    r#"fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push(hex_value(high)? * 16 + hex_value(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+"#
+    .to_string()
 }
 
 fn path_helper(route: &Route) -> String {
@@ -1506,6 +1632,49 @@ mod tests {
     }
 
     #[test]
+    fn generated_parser_handles_methods_and_percent_decoded_params() {
+        let fixture = Fixture::new("generated_parser");
+        fixture.write("home_.rs");
+        fixture.write("not_found_.rs");
+        fixture.write("orders.rs");
+        fixture.write("orders/create.rs");
+        fixture.write("orders/order_id_.rs");
+
+        let mount_routes = discover_mount(fixture.mount()).unwrap();
+        let source_path = fixture.root.join("generated_parser.rs");
+        fs::write(
+            &source_path,
+            generated_parser_runtime_wrapper(&generate_mount_module(&mount_routes)),
+        )
+        .unwrap();
+
+        let binary_path = fixture.root.join("generated_parser");
+        let compile = std::process::Command::new("rustc")
+            .arg("--edition=2024")
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&binary_path)
+            .output()
+            .unwrap();
+
+        assert!(
+            compile.status.success(),
+            "generated parser binary did not compile\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = std::process::Command::new(binary_path).output().unwrap();
+
+        assert!(
+            run.status.success(),
+            "generated parser binary failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    #[test]
     fn generated_router_groups_handlers_by_path() {
         let fixture = Fixture::new("generated_router_groups");
         fixture.write("home_.rs");
@@ -1840,6 +2009,28 @@ mod pages {{
 }}
 
 {generated}
+"#
+        )
+    }
+
+    fn generated_parser_runtime_wrapper(generated: &str) -> String {
+        format!(
+            r#"
+{generated}
+
+fn main() {{
+    assert_eq!(parse_request("GET", "/"), Route::Home);
+    assert_eq!(parse_request("GET", "/orders"), Route::Orders);
+    assert_eq!(parse_request("POST", "/orders"), Route::OrdersCreate);
+    assert_eq!(
+        parse_request("GET", "/orders/a%2Fb?tab=details"),
+        Route::OrdersOrderId {{
+            order_id: "a/b".to_string(),
+        }}
+    );
+    assert_eq!(parse_request("DELETE", "/orders/a%2Fb"), Route::NotFound);
+    assert_eq!(parse_request("GET", "/orders/%GG"), Route::NotFound);
+}}
 "#
         )
     }

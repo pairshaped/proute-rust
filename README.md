@@ -101,3 +101,21 @@ pub fn prefixed_routes() -> axum::Router<crate::app::AppState>
 ```
 
 `prefixed_routes` is generated only for mounts with a language param.
+
+## Parsing
+
+Generated modules expose method-aware parsing:
+
+```rust
+pub fn parse_request(method: &str, raw_path: &str) -> Route
+```
+
+The method is required because HTTP actions can share a path with GET pages:
+
+```text
+GET  /orders -> Route::Orders
+POST /orders -> Route::OrdersCreate
+```
+
+Dynamic path params are percent-decoded after path segmentation, so encoded
+slashes stay inside a param.
