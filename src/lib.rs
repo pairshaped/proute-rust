@@ -1093,6 +1093,7 @@ fn route_from_file(mount: &Mount, source_file: &Path) -> Result<Route, DiscoverE
     }
 
     validate_raw_segments(source_file, &raw_segments)?;
+    validate_file_is_not_namespace_parent(source_file, &raw_segments)?;
 
     let module_path = module_path(mount, source_file)?;
 
@@ -1172,17 +1173,14 @@ fn route_segments(raw_segments: &[String], endpoint: &Endpoint) -> Vec<RouteSegm
         Endpoint::Page => raw_segments,
         Endpoint::Action(_) => &raw_segments[..raw_segments.len() - 1],
     };
+    let path_segments = match path_segments.last().map(String::as_str) {
+        Some("index") => &path_segments[..path_segments.len() - 1],
+        _ => path_segments,
+    };
 
     path_segments
         .iter()
-        .enumerate()
-        .filter_map(|(index, segment)| {
-            if segment == "home_" && index == path_segments.len() - 1 {
-                None
-            } else {
-                Some(route_segment(segment))
-            }
-        })
+        .map(|segment| route_segment(segment))
         .collect()
 }
 
@@ -1279,7 +1277,7 @@ fn not_found_route(mount: &Mount, source_file: &Path, module_path: String) -> Ro
 fn route_name(raw_segments: &[String]) -> String {
     let words = raw_segments
         .iter()
-        .filter(|segment| segment.as_str() != "home_")
+        .filter(|segment| segment.as_str() != "index")
         .flat_map(|segment| segment.trim_end_matches('_').split('_'))
         .filter(|word| !word.is_empty())
         .map(capitalize)
@@ -1295,7 +1293,7 @@ fn route_name(raw_segments: &[String]) -> String {
 fn helper_name(raw_segments: &[String]) -> String {
     let helper = raw_segments
         .iter()
-        .filter(|segment| segment.as_str() != "home_")
+        .filter(|segment| segment.as_str() != "index")
         .map(|segment| segment.trim_end_matches('_'))
         .collect::<Vec<_>>()
         .join("_");
@@ -1352,12 +1350,39 @@ fn validate_raw_segments(source_file: &Path, raw_segments: &[String]) -> Result<
     Ok(())
 }
 
+fn validate_file_is_not_namespace_parent(
+    source_file: &Path,
+    raw_segments: &[String],
+) -> Result<(), DiscoverError> {
+    let Some(segment) = raw_segments.last() else {
+        return Ok(());
+    };
+
+    if matches!(
+        segment.as_str(),
+        "index" | "not_found_" | "create" | "update" | "delete"
+    ) {
+        return Ok(());
+    }
+
+    if source_file.with_extension("").is_dir() {
+        return Err(DiscoverError::ReservedPageSegment {
+            source_file: source_file.to_path_buf(),
+            segment: segment.clone(),
+        });
+    }
+
+    Ok(())
+}
+
 fn is_reserved_page_segment(raw_segments: &[String], index: usize) -> bool {
     let segment = raw_segments[index].as_str();
     let is_last = index == raw_segments.len() - 1;
 
     match segment {
-        "index" | "show" => true,
+        "index" => !is_last,
+        "show" => true,
+        segment if segment.ends_with('_') && is_last && segment != "not_found_" => true,
         "create" | "update" | "delete" => !is_last,
         _ => false,
     }
@@ -1641,12 +1666,12 @@ mod tests {
     #[test]
     fn discovers_proute_routes_with_http_action_overlay() {
         let fixture = Fixture::new("routes");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("orders.rs");
+        fixture.write("orders/index.rs");
         fixture.write("orders/new.rs");
         fixture.write("orders/create.rs");
-        fixture.write("orders/order_id_.rs");
+        fixture.write("orders/order_id_/index.rs");
         fixture.write("orders/order_id_/edit.rs");
         fixture.write("orders/order_id_/update.rs");
         fixture.write("orders/order_id_/delete.rs");
@@ -1668,12 +1693,12 @@ mod tests {
         assert_eq!(
             table,
             [
-                "GET / Home crate::pages::home_",
-                "GET /orders Orders crate::pages::orders",
+                "GET / Home crate::pages::index",
+                "GET /orders Orders crate::pages::orders::index",
                 "POST /orders OrdersCreate crate::pages::orders::create",
                 "GET /orders/export OrdersExport crate::pages::orders::export",
                 "GET /orders/new OrdersNew crate::pages::orders::new",
-                "GET /orders/{order_id} OrdersOrderId crate::pages::orders::order_id_",
+                "GET /orders/{order_id} OrdersOrderId crate::pages::orders::order_id_::index",
                 "POST /orders/{order_id} OrdersOrderIdUpdate crate::pages::orders::order_id_::update",
                 "DELETE /orders/{order_id} OrdersOrderIdDelete crate::pages::orders::order_id_::delete",
                 "GET /orders/{order_id}/edit OrdersOrderIdEdit crate::pages::orders::order_id_::edit",
@@ -1685,9 +1710,9 @@ mod tests {
     #[test]
     fn supports_mount_roots() {
         let fixture = Fixture::new("mount_roots");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("games/id_.rs");
+        fixture.write("games/id_/index.rs");
 
         let mut mount = fixture.mount();
         mount.route_root = "/admin".to_string();
@@ -1702,8 +1727,8 @@ mod tests {
         assert_eq!(
             table,
             [
-                "GET /admin crate::pages::admin::home_",
-                "GET /admin/games/{id} crate::pages::admin::games::id_",
+                "GET /admin crate::pages::admin::index",
+                "GET /admin/games/{id} crate::pages::admin::games::id_::index",
                 "GET /admin/not_found crate::pages::admin::not_found_",
             ]
         );
@@ -1712,9 +1737,9 @@ mod tests {
     #[test]
     fn generated_file_targets_routes_directory() {
         let fixture = Fixture::new("generated_path");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("orders/order_id_.rs");
+        fixture.write("orders/order_id_/index.rs");
 
         let mount_routes = discover_mount(fixture.mount().with_language_param("lang")).unwrap();
         let generated = generate_mount_file(&mount_routes);
@@ -1738,10 +1763,10 @@ mod tests {
     #[test]
     fn generated_routes_include_i18n_prefixes_when_mount_requests_them() {
         let fixture = Fixture::new("i18n_routes");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("orders.rs");
-        fixture.write("orders/order_id_.rs");
+        fixture.write("orders/index.rs");
+        fixture.write("orders/order_id_/index.rs");
 
         let mount_routes = discover_mount(fixture.mount().with_language_param("lang")).unwrap();
         let generated = generate_mount_file(&mount_routes);
@@ -1782,10 +1807,10 @@ mod tests {
     #[test]
     fn generated_module_compiles_as_rust() {
         let fixture = Fixture::new("generated_compiles");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("orders.rs");
-        fixture.write("orders/order_id_.rs");
+        fixture.write("orders/index.rs");
+        fixture.write("orders/order_id_/index.rs");
         fixture.write("orders/order_id_/update.rs");
 
         let mount_routes = discover_mount(fixture.mount().with_language_param("lang")).unwrap();
@@ -1812,11 +1837,11 @@ mod tests {
     #[test]
     fn generated_router_module_compiles_with_stub_axum() {
         let fixture = Fixture::new("generated_router_compiles");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("orders.rs");
+        fixture.write("orders/index.rs");
         fixture.write("orders/create.rs");
-        fixture.write("orders/order_id_.rs");
+        fixture.write("orders/order_id_/index.rs");
         fixture.write("orders/order_id_/update.rs");
         fixture.write("orders/order_id_/delete.rs");
 
@@ -1849,11 +1874,11 @@ mod tests {
     #[test]
     fn generated_parser_handles_methods_and_percent_decoded_params() {
         let fixture = Fixture::new("generated_parser");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("orders.rs");
+        fixture.write("orders/index.rs");
         fixture.write("orders/create.rs");
-        fixture.write("orders/order_id_.rs");
+        fixture.write("orders/order_id_/index.rs");
 
         let mount_routes = discover_mount(fixture.mount().with_language_param("lang")).unwrap();
         let source_path = fixture.root.join("generated_parser.rs");
@@ -1892,11 +1917,11 @@ mod tests {
     #[test]
     fn generated_router_groups_handlers_by_path() {
         let fixture = Fixture::new("generated_router_groups");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("orders.rs");
+        fixture.write("orders/index.rs");
         fixture.write("orders/create.rs");
-        fixture.write("orders/order_id_.rs");
+        fixture.write("orders/order_id_/index.rs");
         fixture.write("orders/order_id_/update.rs");
         fixture.write("orders/order_id_/delete.rs");
 
@@ -1915,22 +1940,22 @@ mod tests {
         );
         assert!(
             generated
-                .contains(".route(\"/orders\", axum::routing::get(crate::pages::orders::handler).post(crate::pages::orders::create::handler))")
+                .contains(".route(\"/orders\", axum::routing::get(crate::pages::orders::index::handler).post(crate::pages::orders::create::handler))")
         );
         assert!(
             generated
-                .contains(".route(\"/orders/{order_id}\", axum::routing::get(crate::pages::orders::order_id_::handler).post(crate::pages::orders::order_id_::update::handler).delete(crate::pages::orders::order_id_::delete::handler))")
+                .contains(".route(\"/orders/{order_id}\", axum::routing::get(crate::pages::orders::order_id_::index::handler).post(crate::pages::orders::order_id_::update::handler).delete(crate::pages::orders::order_id_::delete::handler))")
         );
         assert!(
             generated
-                .contains(".route(\"/{lang}/orders\", axum::routing::get(crate::pages::orders::handler).post(crate::pages::orders::create::handler))")
+                .contains(".route(\"/{lang}/orders\", axum::routing::get(crate::pages::orders::index::handler).post(crate::pages::orders::create::handler))")
         );
     }
 
     #[test]
     fn write_mount_file_writes_under_routes_directory() {
         let fixture = Fixture::new("write_mount_file");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
 
         let output_root = fixture.root.join("generated");
@@ -1951,9 +1976,9 @@ mod tests {
         let fixture = Fixture::new("write_mount_files");
         let public_pages = fixture.root.join("public_pages");
         let admin_pages = fixture.root.join("admin_pages");
-        write_fixture_file(&public_pages, "home_.rs");
+        write_fixture_file(&public_pages, "index.rs");
         write_fixture_file(&public_pages, "not_found_.rs");
-        write_fixture_file(&admin_pages, "home_.rs");
+        write_fixture_file(&admin_pages, "index.rs");
         write_fixture_file(&admin_pages, "not_found_.rs");
 
         let output_root = fixture.root.join("generated");
@@ -1992,7 +2017,7 @@ mod tests {
     #[test]
     fn rejects_invalid_mount_names() {
         let fixture = Fixture::new("invalid_mount");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
 
         let error = discover_mount(Mount::new(
@@ -2010,11 +2035,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_index_and_show_page_segments() {
-        let fixture = Fixture::new("legacy_segments");
-        fixture.write("home_.rs");
+    fn rejects_index_as_intermediate_segment_and_show_pages() {
+        let fixture = Fixture::new("nested_index_segment");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("orders/index.rs");
+        fixture.write("orders/index/details.rs");
 
         let error = discover_mount(fixture.mount()).unwrap_err();
 
@@ -2023,8 +2048,8 @@ mod tests {
             DiscoverError::ReservedPageSegment { segment, .. } if segment == "index"
         ));
 
-        let fixture = Fixture::new("legacy_show");
-        fixture.write("home_.rs");
+        let fixture = Fixture::new("show_page");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
         fixture.write("orders/show.rs");
 
@@ -2037,9 +2062,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_route_files_that_are_also_namespace_parents() {
+        let fixture = Fixture::new("namespace_parent");
+        fixture.write("index.rs");
+        fixture.write("not_found_.rs");
+        fixture.write("orders.rs");
+        fixture.write("orders/new.rs");
+
+        let error = discover_mount(fixture.mount()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DiscoverError::ReservedPageSegment { segment, .. } if segment == "orders"
+        ));
+    }
+
+    #[test]
     fn rejects_mutation_action_names_as_path_segments() {
         let fixture = Fixture::new("action_path_segments");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
         fixture.write("orders/create/confirmation.rs");
 
@@ -2054,9 +2095,9 @@ mod tests {
     #[test]
     fn rejects_route_modules_without_expected_handler() {
         let fixture = Fixture::new("missing_handler");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write_source("orders.rs", "pub(crate) async fn index() {}\n");
+        fixture.write_source("orders/index.rs", "pub(crate) async fn index() {}\n");
 
         let error = discover_mount(fixture.mount()).unwrap_err();
 
@@ -2065,31 +2106,31 @@ mod tests {
             DiscoverError::MissingHandler {
                 source_file,
                 handler_name,
-            } if source_file.ends_with("orders.rs") && handler_name == "handler"
+            } if source_file.ends_with("orders/index.rs") && handler_name == "handler"
         ));
     }
 
     #[test]
     fn validates_custom_handler_names() {
         let fixture = Fixture::new("custom_handler");
-        fixture.write_source("home_.rs", "pub(crate) async fn route() {}\n");
+        fixture.write_source("index.rs", "pub(crate) async fn route() {}\n");
         fixture.write_source("not_found_.rs", "pub(crate) async fn route() {}\n");
-        fixture.write_source("orders.rs", "pub async fn route() {}\n");
+        fixture.write_source("orders/index.rs", "pub async fn route() {}\n");
 
         let routes = discover_mount(fixture.mount().with_handler_name("route"))
             .unwrap()
             .routes;
 
-        assert_eq!(routes[1].handler_path, "crate::pages::orders::route");
+        assert_eq!(routes[1].handler_path, "crate::pages::orders::index::route");
     }
 
     #[test]
     fn validates_multiline_handler_declarations() {
         let fixture = Fixture::new("multiline_handler");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
         fixture.write_source(
-            "orders.rs",
+            "orders/index.rs",
             r#"
 #[allow(dead_code)]
 pub(crate) async fn handler(
@@ -2101,16 +2142,19 @@ pub(crate) async fn handler(
 
         let routes = discover_mount(fixture.mount()).unwrap().routes;
 
-        assert_eq!(routes[1].handler_path, "crate::pages::orders::handler");
+        assert_eq!(
+            routes[1].handler_path,
+            "crate::pages::orders::index::handler"
+        );
     }
 
     #[test]
     fn rejects_duplicate_dynamic_route_patterns_for_same_method() {
         let fixture = Fixture::new("duplicate_patterns");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("orders/id_.rs");
-        fixture.write("orders/slug_.rs");
+        fixture.write("orders/id_/index.rs");
+        fixture.write("orders/slug_/index.rs");
 
         let error = discover_mount(fixture.mount()).unwrap_err();
 
@@ -2127,9 +2171,9 @@ pub(crate) async fn handler(
     #[test]
     fn allows_get_and_post_on_the_same_path() {
         let fixture = Fixture::new("same_path_different_methods");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("orders.rs");
+        fixture.write("orders/index.rs");
         fixture.write("orders/create.rs");
 
         let routes = discover_mount(fixture.mount()).unwrap().routes;
@@ -2145,9 +2189,9 @@ pub(crate) async fn handler(
     #[test]
     fn rejects_duplicate_route_params() {
         let fixture = Fixture::new("duplicate_params");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write("users/user_/repos/user_.rs");
+        fixture.write("users/user_/repos/user_/index.rs");
 
         let error = discover_mount(fixture.mount()).unwrap_err();
 
@@ -2160,7 +2204,7 @@ pub(crate) async fn handler(
     #[test]
     fn ignores_shared_dirs_and_mod_rs() {
         let fixture = Fixture::new("ignored_files");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
         fixture.write("shared/header.rs");
         fixture.write("orders/shared/form.rs");
@@ -2178,7 +2222,7 @@ pub(crate) async fn handler(
     #[test]
     fn requires_not_found() {
         let fixture = Fixture::new("missing_not_found");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
 
         let error = discover_mount(fixture.mount()).unwrap_err();
 
@@ -2188,7 +2232,7 @@ pub(crate) async fn handler(
     #[test]
     fn rejects_reserved_catch_all() {
         let fixture = Fixture::new("catch_all");
-        fixture.write("home_.rs");
+        fixture.write("index.rs");
         fixture.write("not_found_.rs");
         fixture.write("docs/all_.rs");
 
@@ -2295,7 +2339,7 @@ mod app {{
 }}
 
 mod pages {{
-    pub mod home_ {{
+    pub mod index {{
         pub async fn handler() {{}}
     }}
 
@@ -2304,14 +2348,18 @@ mod pages {{
     }}
 
     pub mod orders {{
-        pub async fn handler() {{}}
+        pub mod index {{
+            pub async fn handler() {{}}
+        }}
 
         pub mod create {{
             pub async fn handler() {{}}
         }}
 
         pub mod order_id_ {{
-            pub async fn handler() {{}}
+            pub mod index {{
+                pub async fn handler() {{}}
+            }}
 
             pub mod update {{
                 pub async fn handler() {{}}
