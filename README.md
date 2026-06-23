@@ -27,6 +27,10 @@ Rules:
 - `not_found_.rs` owns the mount 404 route.
 - `all_.rs` is reserved for future catch-all routing.
 - `mod.rs` and every `shared/` directory are ignored.
+- `index.rs` and `show.rs` are rejected. The file itself is the page:
+  use `orders.rs` and `orders/order_id_.rs`.
+- `create`, `update`, and `delete` cannot be used as intermediate path
+  segments. They are action files only.
 
 ## Generated Layout
 

@@ -144,6 +144,10 @@ pub enum DiscoverError {
         source_file: PathBuf,
         segment: String,
     },
+    ReservedPageSegment {
+        source_file: PathBuf,
+        segment: String,
+    },
     InvalidRouteParam {
         source_file: PathBuf,
         param: String,
@@ -209,6 +213,14 @@ impl fmt::Display for DiscoverError {
             } => write!(
                 f,
                 "invalid page path segment {segment:?} in {}",
+                source_file.display()
+            ),
+            DiscoverError::ReservedPageSegment {
+                source_file,
+                segment,
+            } => write!(
+                f,
+                "reserved page path segment {segment:?} in {}. This name is part of proute's route grammar and cannot be used as a GET page segment.",
                 source_file.display()
             ),
             DiscoverError::InvalidRouteParam { source_file, param } => write!(
@@ -1321,9 +1333,16 @@ fn module_path(mount: &Mount, source_file: &Path) -> Result<String, DiscoverErro
 }
 
 fn validate_raw_segments(source_file: &Path, raw_segments: &[String]) -> Result<(), DiscoverError> {
-    for segment in raw_segments {
+    for (index, segment) in raw_segments.iter().enumerate() {
         if !is_valid_module_segment(segment) {
             return Err(DiscoverError::InvalidPageSegment {
+                source_file: source_file.to_path_buf(),
+                segment: segment.clone(),
+            });
+        }
+
+        if is_reserved_page_segment(raw_segments, index) {
+            return Err(DiscoverError::ReservedPageSegment {
                 source_file: source_file.to_path_buf(),
                 segment: segment.clone(),
             });
@@ -1331,6 +1350,17 @@ fn validate_raw_segments(source_file: &Path, raw_segments: &[String]) -> Result<
     }
 
     Ok(())
+}
+
+fn is_reserved_page_segment(raw_segments: &[String], index: usize) -> bool {
+    let segment = raw_segments[index].as_str();
+    let is_last = index == raw_segments.len() - 1;
+
+    match segment {
+        "index" | "show" => true,
+        "create" | "update" | "delete" => !is_last,
+        _ => false,
+    }
 }
 
 fn validate_params(source_file: &Path, params: &[RouteParam]) -> Result<(), DiscoverError> {
@@ -1976,6 +2006,48 @@ mod tests {
         assert!(matches!(
             error,
             DiscoverError::InvalidMountName { mount_name } if mount_name == "public-routes"
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_index_and_show_page_segments() {
+        let fixture = Fixture::new("legacy_segments");
+        fixture.write("home_.rs");
+        fixture.write("not_found_.rs");
+        fixture.write("orders/index.rs");
+
+        let error = discover_mount(fixture.mount()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DiscoverError::ReservedPageSegment { segment, .. } if segment == "index"
+        ));
+
+        let fixture = Fixture::new("legacy_show");
+        fixture.write("home_.rs");
+        fixture.write("not_found_.rs");
+        fixture.write("orders/show.rs");
+
+        let error = discover_mount(fixture.mount()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DiscoverError::ReservedPageSegment { segment, .. } if segment == "show"
+        ));
+    }
+
+    #[test]
+    fn rejects_mutation_action_names_as_path_segments() {
+        let fixture = Fixture::new("action_path_segments");
+        fixture.write("home_.rs");
+        fixture.write("not_found_.rs");
+        fixture.write("orders/create/confirmation.rs");
+
+        let error = discover_mount(fixture.mount()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DiscoverError::ReservedPageSegment { segment, .. } if segment == "create"
         ));
     }
 
