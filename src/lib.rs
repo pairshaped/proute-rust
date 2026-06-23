@@ -130,10 +130,6 @@ pub enum DiscoverError {
     PagesDirectoryUnreadable {
         path: PathBuf,
     },
-    MissingNotFound {
-        mount_name: String,
-        pages: PathBuf,
-    },
     UnsupportedCatchAll {
         source_file: PathBuf,
     },
@@ -194,11 +190,6 @@ impl fmt::Display for DiscoverError {
             DiscoverError::PagesDirectoryUnreadable { path } => {
                 write!(f, "could not read pages directory {}", path.display())
             }
-            DiscoverError::MissingNotFound { mount_name, pages } => write!(
-                f,
-                "mount {mount_name:?} at {} is missing not_found_.rs",
-                pages.display()
-            ),
             DiscoverError::UnsupportedCatchAll { source_file } => write!(
                 f,
                 "unsupported catch-all page {}: all_.rs is reserved but not generated yet",
@@ -315,7 +306,6 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
         routes.push(route_from_file(&mount, &file)?);
     }
 
-    require_not_found(&mount, &routes)?;
     reject_duplicate_routes(&routes)?;
     reject_duplicate_names(&routes)?;
     reject_duplicate_helpers(&routes)?;
@@ -480,8 +470,8 @@ pub struct RouteSpec {
 }
 
 fn route_enum(mount_routes: &MountRoutes) -> String {
-    let variants = mount_routes
-        .routes
+    let display_routes = routes_with_synthetic_not_found(mount_routes);
+    let variants = display_routes
         .iter()
         .map(route_variant)
         .collect::<Vec<_>>()
@@ -766,8 +756,8 @@ fn method_router_fn(method: HttpMethod) -> &'static str {
 }
 
 fn route_to_path(mount_routes: &MountRoutes) -> String {
-    let cases = mount_routes
-        .routes
+    let display_routes = routes_with_synthetic_not_found(mount_routes);
+    let cases = display_routes
         .iter()
         .map(route_to_path_case)
         .collect::<Vec<_>>()
@@ -784,8 +774,8 @@ fn route_to_prefixed_path(mount_routes: &MountRoutes) -> String {
         return String::new();
     };
 
-    let cases = mount_routes
-        .routes
+    let display_routes = routes_with_synthetic_not_found(mount_routes);
+    let cases = display_routes
         .iter()
         .map(|route| route_to_prefixed_path_case(&mount_routes.mount, route))
         .collect::<Vec<_>>()
@@ -866,6 +856,14 @@ fn route_to_url() -> String {
 }
 "#
     .to_string()
+}
+
+fn routes_with_synthetic_not_found(mount_routes: &MountRoutes) -> Vec<Route> {
+    let mut routes = mount_routes.routes.clone();
+    if !routes.iter().any(|route| route.kind == RouteKind::NotFound) {
+        routes.push(synthetic_not_found_route(&mount_routes.mount));
+    }
+    routes
 }
 
 fn route_to_localized_url(mount_routes: &MountRoutes) -> String {
@@ -1274,6 +1272,25 @@ fn not_found_route(mount: &Mount, source_file: &Path, module_path: String) -> Ro
     }
 }
 
+fn synthetic_not_found_route(mount: &Mount) -> Route {
+    let source_file = mount.pages.join("not_found_.rs");
+    let segments = vec![RouteSegment::Static("not_found".to_string())];
+
+    Route {
+        kind: RouteKind::NotFound,
+        endpoint: Endpoint::Page,
+        method: HttpMethod::Get,
+        name: "NotFound".to_string(),
+        helper_name: "not_found".to_string(),
+        path: route_path(&mount.route_root, &segments),
+        segments,
+        params: Vec::new(),
+        source_file,
+        module_path: String::new(),
+        handler_path: String::new(),
+    }
+}
+
 fn route_name(raw_segments: &[String]) -> String {
     let words = raw_segments
         .iter()
@@ -1466,17 +1483,6 @@ fn is_reserved_rust_word(name: &str) -> bool {
             | "where"
             | "while"
     )
-}
-
-fn require_not_found(mount: &Mount, routes: &[Route]) -> Result<(), DiscoverError> {
-    if routes.iter().any(|route| route.kind == RouteKind::NotFound) {
-        Ok(())
-    } else {
-        Err(DiscoverError::MissingNotFound {
-            mount_name: mount.name.clone(),
-            pages: mount.pages.clone(),
-        })
-    }
 }
 
 fn reject_duplicate_routes(routes: &[Route]) -> Result<(), DiscoverError> {
@@ -1808,7 +1814,6 @@ mod tests {
     fn generated_module_compiles_as_rust() {
         let fixture = Fixture::new("generated_compiles");
         fixture.write("index.rs");
-        fixture.write("not_found_.rs");
         fixture.write("orders/index.rs");
         fixture.write("orders/order_id_/index.rs");
         fixture.write("orders/order_id_/update.rs");
@@ -1875,7 +1880,6 @@ mod tests {
     fn generated_parser_handles_methods_and_percent_decoded_params() {
         let fixture = Fixture::new("generated_parser");
         fixture.write("index.rs");
-        fixture.write("not_found_.rs");
         fixture.write("orders/index.rs");
         fixture.write("orders/create.rs");
         fixture.write("orders/order_id_/index.rs");
@@ -2220,13 +2224,24 @@ pub(crate) async fn handler(
     }
 
     #[test]
-    fn requires_not_found() {
+    fn generates_not_found_fallback_without_not_found_file() {
         let fixture = Fixture::new("missing_not_found");
         fixture.write("index.rs");
 
-        let error = discover_mount(fixture.mount()).unwrap_err();
+        let mount_routes = discover_mount(fixture.mount()).unwrap();
+        let generated = generate_mount_module(&mount_routes);
+        let route_paths = mount_routes
+            .routes
+            .iter()
+            .map(|route| route.path.as_str())
+            .collect::<Vec<_>>();
 
-        assert!(matches!(error, DiscoverError::MissingNotFound { .. }));
+        assert_eq!(route_paths, ["/"]);
+        assert!(generated.contains("pub enum Route {\n    Home,\n    NotFound,\n}"));
+        assert!(generated.contains("_ => Route::NotFound,"));
+        assert!(generated.contains("Route::NotFound => \"/not_found\".to_string(),"));
+        assert!(!generated.contains("path: \"/not_found\""));
+        assert!(!generated.contains(".route(\"/not_found\""));
     }
 
     #[test]
@@ -2400,6 +2415,11 @@ fn main() {{
     );
     assert_eq!(parse_request("DELETE", "/orders/a%2Fb"), Route::NotFound);
     assert_eq!(parse_request("GET", "/orders/%GG"), Route::NotFound);
+    assert_eq!(route_to_path(&Route::NotFound), "/not_found".to_string());
+    assert_eq!(
+        route_to_prefixed_path(&Route::NotFound, "fr"),
+        "/fr/not_found".to_string()
+    );
     assert_eq!(
         parse_localized_request("GET", "/orders"),
         ParsedRequest {{
