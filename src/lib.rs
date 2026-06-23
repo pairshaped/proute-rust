@@ -175,6 +175,13 @@ pub enum DiscoverError {
     InvalidMountName {
         mount_name: String,
     },
+    PageFileUnreadable {
+        source_file: PathBuf,
+    },
+    MissingHandler {
+        source_file: PathBuf,
+        handler_name: String,
+    },
 }
 
 impl fmt::Display for DiscoverError {
@@ -255,6 +262,17 @@ impl fmt::Display for DiscoverError {
             DiscoverError::InvalidMountName { mount_name } => {
                 write!(f, "invalid mount name {mount_name:?}")
             }
+            DiscoverError::PageFileUnreadable { source_file } => {
+                write!(f, "could not read page file {}", source_file.display())
+            }
+            DiscoverError::MissingHandler {
+                source_file,
+                handler_name,
+            } => write!(
+                f,
+                "missing handler {handler_name:?} in {}. Expected `pub(crate) async fn {handler_name}` or `pub async fn {handler_name}`.",
+                source_file.display()
+            ),
         }
     }
 }
@@ -289,6 +307,7 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
     reject_duplicate_routes(&routes)?;
     reject_duplicate_names(&routes)?;
     reject_duplicate_helpers(&routes)?;
+    validate_handlers(&mount, &routes)?;
     routes.sort_by(route_sort_key);
 
     Ok(MountRoutes { mount, routes })
@@ -1411,6 +1430,53 @@ fn reject_duplicate_helpers(routes: &[Route]) -> Result<(), DiscoverError> {
     Ok(())
 }
 
+fn validate_handlers(mount: &Mount, routes: &[Route]) -> Result<(), DiscoverError> {
+    for route in routes {
+        let source = fs::read_to_string(&route.source_file).map_err(|_| {
+            DiscoverError::PageFileUnreadable {
+                source_file: route.source_file.clone(),
+            }
+        })?;
+
+        if !has_public_handler(&source, &mount.handler_name) {
+            return Err(DiscoverError::MissingHandler {
+                source_file: route.source_file.clone(),
+                handler_name: mount.handler_name.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn has_public_handler(source: &str, handler_name: &str) -> bool {
+    let declarations = public_fn_declarations(source);
+    declarations.iter().any(|declaration| {
+        declaration.starts_with(&format!("pub(crate) async fn {handler_name}"))
+            || declaration.starts_with(&format!("pub(crate) fn {handler_name}"))
+            || declaration.starts_with(&format!("pub async fn {handler_name}"))
+            || declaration.starts_with(&format!("pub fn {handler_name}"))
+    })
+}
+
+fn public_fn_declarations(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .map(strip_line_comment)
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub"))
+        .map(normalize_whitespace)
+        .collect()
+}
+
+fn strip_line_comment(line: &str) -> &str {
+    line.split("//").next().unwrap_or(line)
+}
+
+fn normalize_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn route_sort_key(left: &Route, right: &Route) -> std::cmp::Ordering {
     comparable_route_key(left).cmp(&comparable_route_key(right))
 }
@@ -1831,6 +1897,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_route_modules_without_expected_handler() {
+        let fixture = Fixture::new("missing_handler");
+        fixture.write("home_.rs");
+        fixture.write("not_found_.rs");
+        fixture.write_source("orders.rs", "pub(crate) async fn index() {}\n");
+
+        let error = discover_mount(fixture.mount()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DiscoverError::MissingHandler {
+                source_file,
+                handler_name,
+            } if source_file.ends_with("orders.rs") && handler_name == "handler"
+        ));
+    }
+
+    #[test]
+    fn validates_custom_handler_names() {
+        let fixture = Fixture::new("custom_handler");
+        fixture.write_source("home_.rs", "pub(crate) async fn route() {}\n");
+        fixture.write_source("not_found_.rs", "pub(crate) async fn route() {}\n");
+        fixture.write_source("orders.rs", "pub async fn route() {}\n");
+
+        let routes = discover_mount(fixture.mount().with_handler_name("route"))
+            .unwrap()
+            .routes;
+
+        assert_eq!(routes[1].handler_path, "crate::pages::orders::route");
+    }
+
+    #[test]
     fn rejects_duplicate_dynamic_route_patterns_for_same_method() {
         let fixture = Fixture::new("duplicate_patterns");
         fixture.write("home_.rs");
@@ -1943,7 +2041,13 @@ mod tests {
         fn write(&self, relative: &str) {
             let path = self.pages.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, "").unwrap();
+            fs::write(path, "pub(crate) async fn handler() {}\n").unwrap();
+        }
+
+        fn write_source(&self, relative: &str, source: &str) {
+            let path = self.pages.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
         }
 
         fn mount(&self) -> Mount {
@@ -1960,7 +2064,7 @@ mod tests {
     fn write_fixture_file(root: &Path, relative: &str) {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, "").unwrap();
+        fs::write(path, "pub(crate) async fn handler() {}\n").unwrap();
     }
 
     fn generated_router_compile_wrapper(generated: &str) -> String {
