@@ -96,6 +96,18 @@ Mount::new("public", "src/pages/public", "/", "crate::pages::public")
     .with_handler_name("route")
 ```
 
+Apps that prefer action-named handlers can opt in to deriving the handler name
+from the route file:
+
+```rust
+Mount::new("admin", "src/pages/admin", "/admin", "crate::pages::admin")
+    .with_route_action_handler_names()
+```
+
+In that mode, `orders/index.rs` expects `index`, `orders/create.rs` expects
+`create`, `orders/order_id_/edit.rs` expects `edit`, and `not_found_.rs`
+expects `not_found`.
+
 When a mount has a router state type, the generated module includes Axum router
 functions:
 

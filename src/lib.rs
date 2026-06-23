@@ -11,7 +11,14 @@ pub struct Mount {
     pub module_root: String,
     pub language_param: Option<String>,
     pub handler_name: String,
+    pub handler_names: HandlerNames,
     pub router_state_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HandlerNames {
+    Fixed(String),
+    RouteAction,
 }
 
 impl Mount {
@@ -28,6 +35,7 @@ impl Mount {
             module_root: module_root.into(),
             language_param: None,
             handler_name: "handler".to_string(),
+            handler_names: HandlerNames::Fixed("handler".to_string()),
             router_state_type: None,
         }
     }
@@ -38,7 +46,14 @@ impl Mount {
     }
 
     pub fn with_handler_name(mut self, handler_name: impl Into<String>) -> Self {
-        self.handler_name = handler_name.into();
+        let handler_name = handler_name.into();
+        self.handler_name = handler_name.clone();
+        self.handler_names = HandlerNames::Fixed(handler_name);
+        self
+    }
+
+    pub fn with_route_action_handler_names(mut self) -> Self {
+        self.handler_names = HandlerNames::RouteAction;
         self
     }
 
@@ -66,6 +81,7 @@ pub struct Route {
     pub params: Vec<RouteParam>,
     pub source_file: PathBuf,
     pub module_path: String,
+    pub handler_name: String,
     pub handler_path: String,
 }
 
@@ -288,7 +304,7 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
             mount_name: mount.name.clone(),
         });
     }
-    if !is_valid_label(&mount.handler_name) {
+    if !is_valid_handler_names(&mount.handler_names) {
         return Err(DiscoverError::InvalidRouteName {
             source_file: mount.pages.clone(),
             name: mount.handler_name.clone(),
@@ -309,7 +325,7 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
     reject_duplicate_routes(&routes)?;
     reject_duplicate_names(&routes)?;
     reject_duplicate_helpers(&routes)?;
-    validate_handlers(&mount, &routes)?;
+    validate_handlers(&routes)?;
     routes.sort_by(route_sort_key);
 
     Ok(MountRoutes { mount, routes })
@@ -1115,7 +1131,8 @@ fn route_from_file(mount: &Mount, source_file: &Path) -> Result<Route, DiscoverE
         });
     }
 
-    let handler_path = format!("{module_path}::{}", mount.handler_name);
+    let handler_name = handler_name_for(mount, &raw_segments);
+    let handler_path = format!("{module_path}::{handler_name}");
 
     Ok(Route {
         kind: route_kind(&route_segments),
@@ -1127,6 +1144,7 @@ fn route_from_file(mount: &Mount, source_file: &Path) -> Result<Route, DiscoverE
         params,
         source_file: source_file.to_path_buf(),
         module_path,
+        handler_name,
         handler_path,
         name,
     })
@@ -1255,7 +1273,8 @@ fn pattern_path(path: &str) -> String {
 
 fn not_found_route(mount: &Mount, source_file: &Path, module_path: String) -> Route {
     let segments = vec![RouteSegment::Static("not_found".to_string())];
-    let handler_path = format!("{module_path}::{}", mount.handler_name);
+    let handler_name = handler_name_for(mount, &["not_found_".to_string()]);
+    let handler_path = format!("{module_path}::{handler_name}");
 
     Route {
         kind: RouteKind::NotFound,
@@ -1268,6 +1287,7 @@ fn not_found_route(mount: &Mount, source_file: &Path, module_path: String) -> Ro
         params: Vec::new(),
         source_file: source_file.to_path_buf(),
         module_path,
+        handler_name,
         handler_path,
     }
 }
@@ -1287,7 +1307,25 @@ fn synthetic_not_found_route(mount: &Mount) -> Route {
         params: Vec::new(),
         source_file,
         module_path: String::new(),
+        handler_name: String::new(),
         handler_path: String::new(),
+    }
+}
+
+fn is_valid_handler_names(handler_names: &HandlerNames) -> bool {
+    match handler_names {
+        HandlerNames::Fixed(handler_name) => is_valid_label(handler_name),
+        HandlerNames::RouteAction => true,
+    }
+}
+
+fn handler_name_for(mount: &Mount, raw_segments: &[String]) -> String {
+    match &mount.handler_names {
+        HandlerNames::Fixed(handler_name) => handler_name.clone(),
+        HandlerNames::RouteAction => raw_segments
+            .last()
+            .map(|segment| segment.trim_end_matches('_').to_string())
+            .unwrap_or_else(|| "index".to_string()),
     }
 }
 
@@ -1548,7 +1586,7 @@ fn reject_duplicate_helpers(routes: &[Route]) -> Result<(), DiscoverError> {
     Ok(())
 }
 
-fn validate_handlers(mount: &Mount, routes: &[Route]) -> Result<(), DiscoverError> {
+fn validate_handlers(routes: &[Route]) -> Result<(), DiscoverError> {
     for route in routes {
         let source = fs::read_to_string(&route.source_file).map_err(|_| {
             DiscoverError::PageFileUnreadable {
@@ -1556,10 +1594,10 @@ fn validate_handlers(mount: &Mount, routes: &[Route]) -> Result<(), DiscoverErro
             }
         })?;
 
-        if !has_public_handler(&source, &mount.handler_name) {
+        if !has_public_handler(&source, &route.handler_name) {
             return Err(DiscoverError::MissingHandler {
                 source_file: route.source_file.clone(),
-                handler_name: mount.handler_name.clone(),
+                handler_name: route.handler_name.clone(),
             });
         }
     }
@@ -2126,6 +2164,57 @@ mod tests {
             .routes;
 
         assert_eq!(routes[1].handler_path, "crate::pages::orders::index::route");
+    }
+
+    #[test]
+    fn supports_route_action_handler_names() {
+        let fixture = Fixture::new("route_action_handlers");
+        fixture.write_source("index.rs", "pub(crate) async fn index() {}\n");
+        fixture.write_source("not_found_.rs", "pub(crate) async fn not_found() {}\n");
+        fixture.write_source("orders/index.rs", "pub(crate) async fn index() {}\n");
+        fixture.write_source("orders/new.rs", "pub(crate) async fn new() {}\n");
+        fixture.write_source("orders/create.rs", "pub(crate) async fn create() {}\n");
+        fixture.write_source(
+            "orders/order_id_/index.rs",
+            "pub(crate) async fn index() {}\n",
+        );
+        fixture.write_source(
+            "orders/order_id_/edit.rs",
+            "pub(crate) async fn edit() {}\n",
+        );
+        fixture.write_source(
+            "orders/order_id_/update.rs",
+            "pub(crate) async fn update() {}\n",
+        );
+        fixture.write_source(
+            "orders/order_id_/delete.rs",
+            "pub(crate) async fn delete() {}\n",
+        );
+        fixture.write_source("orders/export.rs", "pub(crate) async fn export() {}\n");
+
+        let routes = discover_mount(fixture.mount().with_route_action_handler_names())
+            .unwrap()
+            .routes;
+        let handlers = routes
+            .iter()
+            .map(|route| format!("{} {} {}", route.method, route.path, route.handler_path))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            handlers,
+            [
+                "GET / crate::pages::index::index",
+                "GET /orders crate::pages::orders::index::index",
+                "POST /orders crate::pages::orders::create::create",
+                "GET /orders/export crate::pages::orders::export::export",
+                "GET /orders/new crate::pages::orders::new::new",
+                "GET /orders/{order_id} crate::pages::orders::order_id_::index::index",
+                "POST /orders/{order_id} crate::pages::orders::order_id_::update::update",
+                "DELETE /orders/{order_id} crate::pages::orders::order_id_::delete::delete",
+                "GET /orders/{order_id}/edit crate::pages::orders::order_id_::edit::edit",
+                "GET /not_found crate::pages::not_found_::not_found",
+            ]
+        );
     }
 
     #[test]
