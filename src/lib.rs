@@ -1,7 +1,44 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::future::Future;
+use std::path::{Path as StdPath, PathBuf};
+
+use quote::ToTokens;
+
+pub use axum;
+pub use serde;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Path<T>(pub T);
+
+impl<T> std::ops::Deref for Path<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T, S> axum::extract::FromRequestParts<S> for Path<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = axum::http::StatusCode;
+
+    fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        async move {
+            axum::extract::Path::<T>::from_request_parts(parts, state)
+                .await
+                .map(|axum::extract::Path(value)| Self(value))
+                .map_err(|_| axum::http::StatusCode::NOT_FOUND)
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mount {
@@ -100,12 +137,25 @@ pub struct Route {
     pub module_path: String,
     pub handler_name: String,
     pub handler_path: String,
+    pub contract: Option<RouteContract>,
 }
 
 impl Route {
     pub fn pattern_path(&self) -> String {
         pattern_path(&self.path)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteContract {
+    pub type_path: String,
+    pub fields: Vec<RouteContractField>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteContractField {
+    pub name: String,
+    pub type_name: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -215,6 +265,10 @@ pub enum DiscoverError {
         source_file: PathBuf,
         handler_name: String,
     },
+    InvalidRouteContract {
+        source_file: PathBuf,
+        message: String,
+    },
 }
 
 impl fmt::Display for DiscoverError {
@@ -309,6 +363,14 @@ impl fmt::Display for DiscoverError {
                 "missing handler {handler_name:?} in {}. Expected `pub(crate) async fn {handler_name}` or `pub async fn {handler_name}`.",
                 source_file.display()
             ),
+            DiscoverError::InvalidRouteContract {
+                source_file,
+                message,
+            } => write!(
+                f,
+                "invalid route contract in {}: {message}",
+                source_file.display()
+            ),
         }
     }
 }
@@ -380,7 +442,7 @@ impl fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
-pub fn write_mount_file(output_root: &Path, mount: Mount) -> Result<GeneratedFile, WriteError> {
+pub fn write_mount_file(output_root: &StdPath, mount: Mount) -> Result<GeneratedFile, WriteError> {
     let mount_routes = discover_mount(mount).map_err(WriteError::Discover)?;
     let generated = generate_mount_file(&mount_routes);
     write_generated_file(output_root, &generated)?;
@@ -389,7 +451,7 @@ pub fn write_mount_file(output_root: &Path, mount: Mount) -> Result<GeneratedFil
 }
 
 pub fn write_mount_files(
-    output_root: &Path,
+    output_root: &StdPath,
     mounts: impl IntoIterator<Item = Mount>,
 ) -> Result<Vec<GeneratedFile>, WriteError> {
     let mount_routes = mounts
@@ -411,7 +473,10 @@ pub fn write_mount_files(
     Ok(generated)
 }
 
-fn write_generated_file(output_root: &Path, generated: &GeneratedFile) -> Result<(), WriteError> {
+fn write_generated_file(
+    output_root: &StdPath,
+    generated: &GeneratedFile,
+) -> Result<(), WriteError> {
     let output_path = output_root.join(&generated.path);
 
     if let Some(parent) = output_path.parent() {
@@ -431,7 +496,7 @@ fn write_generated_file(output_root: &Path, generated: &GeneratedFile) -> Result
 
 pub fn generate_mount_file(mount_routes: &MountRoutes) -> GeneratedFile {
     GeneratedFile {
-        path: PathBuf::from("routes").join(format!("{}.rs", mount_routes.mount.name)),
+        path: PathBuf::from("proute").join(format!("{}.rs", mount_routes.mount.name)),
         contents: generate_mount_module(mount_routes),
     }
 }
@@ -444,7 +509,7 @@ pub fn generate_routes_mod_file(mount_routes: &[MountRoutes]) -> GeneratedFile {
         .join("\n");
 
     GeneratedFile {
-        path: PathBuf::from("routes").join("mod.rs"),
+        path: PathBuf::from("proute").join("mod.rs"),
         contents: format!("//// Generated. Do not edit.\n\n{modules}\n"),
     }
 }
@@ -453,22 +518,10 @@ pub fn generate_mount_module(mount_routes: &MountRoutes) -> String {
     let mut sections = Vec::new();
     sections.push(generated_header(mount_routes));
     sections.push(route_spec_type());
-    sections.push(route_enum(mount_routes));
-    sections.push(parsed_request_type(mount_routes));
     sections.push(route_table(mount_routes));
     sections.push(router_functions(mount_routes));
-    sections.push(parse_request(mount_routes));
-    sections.push(parse_localized_request(mount_routes));
-    sections.push(route_to_path(mount_routes));
-    sections.push(route_to_prefixed_path(mount_routes));
-    sections.push(route_to_localized_path(mount_routes));
-    sections.push(route_to_url());
-    sections.push(route_to_localized_url(mount_routes));
     sections.push(path_helpers(mount_routes));
-    sections.push(path_segments_function());
     sections.push(percent_encode_function());
-    sections.push(percent_decode_function());
-    sections.push(trim_trailing_slash());
 
     sections.join("\n")
 }
@@ -500,44 +553,6 @@ pub struct RouteSpec {
 }
 "#
     .to_string()
-}
-
-fn route_enum(mount_routes: &MountRoutes) -> String {
-    let display_routes = routes_with_synthetic_not_found(mount_routes);
-    let variants = display_routes
-        .iter()
-        .map(route_variant)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "#[derive(Clone, Debug, Eq, PartialEq)]\npub enum Route {{\n{}\n}}\n",
-        indent_lines(&variants, 4)
-    )
-}
-
-fn parsed_request_type(mount_routes: &MountRoutes) -> String {
-    let Some(language_param) = mount_routes.mount.language_param.as_deref() else {
-        return String::new();
-    };
-
-    format!(
-        "#[derive(Clone, Debug, Eq, PartialEq)]\npub struct ParsedRequest {{\n    pub route: Route,\n    pub {language_param}: Option<String>,\n}}\n"
-    )
-}
-
-fn route_variant(route: &Route) -> String {
-    if route.params.is_empty() {
-        format!("{},", route.name)
-    } else {
-        let fields = route
-            .params
-            .iter()
-            .map(|param| format!("{}: {}", param.name, param.type_name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{} {{ {} }},", route.name, fields)
-    }
 }
 
 fn route_table(mount_routes: &MountRoutes) -> String {
@@ -582,130 +597,6 @@ fn router_functions(mount_routes: &MountRoutes) -> String {
     );
 
     format!("{canonical}\n{prefixed}")
-}
-
-fn parse_request(mount_routes: &MountRoutes) -> String {
-    let cases = mount_routes
-        .routes
-        .iter()
-        .map(parse_request_case)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        r#"pub fn parse_request(method: &str, raw_path: &str) -> Route {{
-    let path = raw_path.split(['?', '#']).next().unwrap_or(raw_path);
-    let segments = path_segments(path);
-    parse_segments(method, segments.as_slice())
-}}
-
-fn parse_segments(method: &str, segments: &[&str]) -> Route {{
-    match (method, segments) {{
-{}
-        _ => Route::NotFound,
-    }}
-}}
-"#,
-        indent_lines(&cases, 8)
-    )
-}
-
-fn parse_localized_request(mount_routes: &MountRoutes) -> String {
-    let Some(language_param) = mount_routes.mount.language_param.as_deref() else {
-        return String::new();
-    };
-
-    format!(
-        r#"pub fn parse_localized_request(method: &str, raw_path: &str) -> ParsedRequest {{
-    let path = raw_path.split(['?', '#']).next().unwrap_or(raw_path);
-    let segments = path_segments(path);
-    let canonical = parse_segments(method, segments.as_slice());
-
-    if canonical != Route::NotFound {{
-        return ParsedRequest {{
-            route: canonical,
-            {language_param}: None,
-        }};
-    }}
-
-    match segments.as_slice() {{
-        [{language_param}, rest @ ..] => {{
-            let Some({language_param}) = percent_decode({language_param}) else {{
-                return ParsedRequest {{
-                    route: Route::NotFound,
-                    {language_param}: None,
-                }};
-            }};
-            let route = parse_segments(method, rest);
-            ParsedRequest {{
-                route,
-                {language_param}: Some({language_param}),
-            }}
-        }}
-        _ => ParsedRequest {{
-            route: parse_segments(method, segments.as_slice()),
-            {language_param}: None,
-        }},
-    }}
-}}
-"#
-    )
-}
-
-fn parse_request_case(route: &Route) -> String {
-    let pattern = parse_segment_pattern(route);
-    if route.params.is_empty() {
-        format!(
-            "({:?}, {pattern}) => Route::{},",
-            route.method.to_string(),
-            route.name
-        )
-    } else {
-        let decoders = parse_dynamic_decoders(route);
-        format!(
-            "({:?}, {pattern}) => {{\n{}\n        }},",
-            route.method.to_string(),
-            indent_lines(&decoders, 12)
-        )
-    }
-}
-
-fn parse_segment_pattern(route: &Route) -> String {
-    if route.segments.is_empty() {
-        return "[]".to_string();
-    }
-
-    let segments = route
-        .segments
-        .iter()
-        .map(|segment| match segment {
-            RouteSegment::Static(value) => format!("{value:?}"),
-            RouteSegment::Dynamic(name) => name.as_str().to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    format!("[{segments}]")
-}
-
-fn parse_dynamic_decoders(route: &Route) -> String {
-    let mut lines = Vec::new();
-    for param in &route.params {
-        lines.push(format!(
-            "let Some({}) = percent_decode({}) else {{ return Route::NotFound; }};",
-            param.name, param.name
-        ));
-    }
-
-    let fields = route
-        .params
-        .iter()
-        .map(|param| format!("{}: {}", param.name, param.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    lines.push(format!("Route::{} {{ {} }}", route.name, fields));
-    lines.join("\n")
 }
 
 fn router_function(name: &str, state_type: &str, groups: &[RouteGroup]) -> String {
@@ -795,148 +686,13 @@ fn method_router_fn(method: HttpMethod) -> &'static str {
     }
 }
 
-fn route_to_path(mount_routes: &MountRoutes) -> String {
-    let display_routes = routes_with_synthetic_not_found(mount_routes);
-    let cases = display_routes
-        .iter()
-        .map(route_to_path_case)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "pub fn route_to_path(route: &Route) -> String {{\n    match route {{\n{}\n    }}\n}}\n",
-        indent_lines(&cases, 8)
-    )
-}
-
-fn route_to_prefixed_path(mount_routes: &MountRoutes) -> String {
-    let Some(language_param) = mount_routes.mount.language_param.as_deref() else {
-        return String::new();
-    };
-
-    let display_routes = routes_with_synthetic_not_found(mount_routes);
-    let cases = display_routes
-        .iter()
-        .map(|route| route_to_prefixed_path_case(&mount_routes.mount, route))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "pub fn route_to_prefixed_path(route: &Route, {language_param}: &str) -> String {{\n    match route {{\n{}\n    }}\n}}\n",
-        indent_lines(&cases, 8)
-    )
-}
-
-fn route_to_prefixed_path_case(mount: &Mount, route: &Route) -> String {
-    let pattern = route_pattern(route);
-    let Some(prefixed_path) = prefixed_route_path(mount, &route.path) else {
-        return format!("{pattern} => route_to_path(route),");
-    };
-
-    let expression = path_expression_from_template(&prefixed_path);
-    format!("{pattern} => {expression},")
-}
-
-fn route_to_localized_path(mount_routes: &MountRoutes) -> String {
-    let Some(language_param) = mount_routes.mount.language_param.as_deref() else {
-        return String::new();
-    };
-
-    format!(
-        r#"pub fn route_to_localized_path(route: &Route, {language_param}: &str, primary_lang: &str) -> String {{
-    if {language_param} == primary_lang {{
-        route_to_path(route)
-    }} else {{
-        route_to_prefixed_path(route, {language_param})
-    }}
-}}
-"#
-    )
-}
-
-fn route_to_path_case(route: &Route) -> String {
-    let pattern = route_pattern(route);
-    if route.params.is_empty() {
-        format!("{pattern} => {:?}.to_string(),", route.path)
-    } else {
-        format!(
-            "{pattern} => {}({}),",
-            route.helper_name,
-            helper_args(route)
-        )
-    }
-}
-
-fn route_pattern(route: &Route) -> String {
-    if route.params.is_empty() {
-        format!("Route::{}", route.name)
-    } else {
-        let fields = route
-            .params
-            .iter()
-            .map(|param| param.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("Route::{} {{ {} }}", route.name, fields)
-    }
-}
-
-fn helper_args(route: &Route) -> String {
-    route
-        .params
-        .iter()
-        .map(|param| param.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn route_to_url() -> String {
-    r#"pub fn route_to_url(route: &Route, origin: &str) -> String {
-    format!("{}{}", trim_trailing_slash(origin), route_to_path(route))
-}
-"#
-    .to_string()
-}
-
-fn routes_with_synthetic_not_found(mount_routes: &MountRoutes) -> Vec<Route> {
-    let mut routes = mount_routes.routes.clone();
-    if !routes.iter().any(|route| route.kind == RouteKind::NotFound) {
-        routes.push(synthetic_not_found_route(&mount_routes.mount));
-    }
-    routes
-}
-
-fn route_to_localized_url(mount_routes: &MountRoutes) -> String {
-    let Some(language_param) = mount_routes.mount.language_param.as_deref() else {
-        return String::new();
-    };
-
-    format!(
-        r#"pub fn route_to_localized_url(route: &Route, origin: &str, {language_param}: &str, primary_lang: &str) -> String {{
-    format!("{{}}{{}}", trim_trailing_slash(origin), route_to_localized_path(route, {language_param}, primary_lang))
-}}
-"#
-    )
-}
-
 fn path_helpers(mount_routes: &MountRoutes) -> String {
     mount_routes
         .routes
         .iter()
-        .map(path_helper)
+        .flat_map(|route| path_helpers_for_route(&mount_routes.mount, route))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn path_segments_function() -> String {
-    r#"fn path_segments(path: &str) -> Vec<&str> {
-    path.trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect()
-}
-"#
-    .to_string()
 }
 
 fn percent_encode_function() -> String {
@@ -964,63 +720,164 @@ fn is_unreserved(byte: u8) -> bool {
     .to_string()
 }
 
-fn percent_decode_function() -> String {
-    r#"fn percent_decode(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
+fn path_helpers_for_route(mount: &Mount, route: &Route) -> Vec<String> {
+    let mut helpers = vec![path_helper(route, &route.helper_name, &route.path)];
 
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let high = *bytes.get(index + 1)?;
-            let low = *bytes.get(index + 2)?;
-            decoded.push(hex_value(high)? * 16 + hex_value(low)?);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
+    if let Some(language_param) = mount.language_param.as_deref() {
+        let prefixed_name = prefixed_helper_name(&route.helper_name);
+        let prefixed_path =
+            prefixed_route_path(mount, &route.path).unwrap_or_else(|| route.path.clone());
+        helpers.push(prefixed_path_helper(
+            route,
+            &prefixed_name,
+            language_param,
+            &prefixed_path,
+        ));
+
+        let localized_name = localized_helper_name(&route.helper_name);
+        helpers.push(localized_path_helper(
+            &localized_name,
+            &prefixed_name,
+            route,
+            language_param,
+        ));
     }
 
-    String::from_utf8(decoded).ok()
+    helpers
 }
 
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
+fn prefixed_helper_name(helper_name: &str) -> String {
+    format!("prefixed_{helper_name}")
+}
+
+fn localized_helper_name(helper_name: &str) -> String {
+    format!("localized_{helper_name}")
+}
+
+fn path_helper(route: &Route, helper_name: &str, path: &str) -> String {
+    if let Some(contract) = &route.contract {
+        let expression = typed_path_expression_from_template(path, "params", contract);
+        return format!(
+            "#[allow(non_snake_case)]\npub fn {helper_name}(params: &{}) -> String {{\n    {expression}\n}}\n",
+            contract.type_path
+        );
     }
-}
-"#
-    .to_string()
-}
 
-fn path_helper(route: &Route) -> String {
     if route.params.is_empty() {
         format!(
-            "pub fn {}() -> &'static str {{\n    {:?}\n}}\n",
-            route.helper_name, route.path
+            "#[allow(non_snake_case)]\npub fn {helper_name}() -> &'static str {{\n    {path:?}\n}}\n"
         )
     } else {
-        let args = route
-            .params
-            .iter()
-            .map(|param| format!("{}: impl std::fmt::Display", param.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let expression = path_expression(route);
+        let args = route_helper_params(route);
+        let expression = path_expression_from_template(path);
 
         format!(
-            "pub fn {}({}) -> String {{\n    {}\n}}\n",
-            route.helper_name, args, expression
+            "#[allow(non_snake_case)]\npub fn {helper_name}({args}) -> String {{\n    {expression}\n}}\n"
         )
     }
 }
 
-fn path_expression(route: &Route) -> String {
-    path_expression_from_template(&route.path)
+fn prefixed_path_helper(
+    route: &Route,
+    helper_name: &str,
+    language_param: &str,
+    path: &str,
+) -> String {
+    if let Some(contract) = &route.contract {
+        let expression = typed_path_expression_from_template(path, "params", contract);
+        return format!(
+            "#[allow(non_snake_case)]\npub fn {helper_name}({language_param}: impl std::fmt::Display, params: &{}) -> String {{\n    {expression}\n}}\n",
+            contract.type_path
+        );
+    }
+
+    let mut params = vec![RouteParam {
+        name: language_param.to_string(),
+        type_name: "String".to_string(),
+    }];
+    params.extend(route.params.clone());
+    let args = helper_params(&params);
+    let expression = path_expression_from_template(path);
+
+    format!(
+        "#[allow(non_snake_case)]\npub fn {helper_name}({args}) -> String {{\n    {expression}\n}}\n"
+    )
+}
+
+fn localized_path_helper(
+    localized_name: &str,
+    prefixed_name: &str,
+    route: &Route,
+    language_param: &str,
+) -> String {
+    let canonical_expression = if route.contract.is_some() {
+        format!("{}(params).to_string()", route.helper_name)
+    } else if route.params.is_empty() {
+        format!("{}().to_string()", route.helper_name)
+    } else {
+        let canonical_args = helper_args(&route.params);
+        format!("{}({canonical_args})", route.helper_name)
+    };
+    let prefixed_args = if route.contract.is_some() {
+        format!("{language_param}, params")
+    } else {
+        let mut params = vec![RouteParam {
+            name: language_param.to_string(),
+            type_name: "String".to_string(),
+        }];
+        params.extend(route.params.clone());
+        helper_args(&params)
+    };
+    let args = localized_helper_params(route, language_param);
+
+    format!(
+        "#[allow(non_snake_case)]\npub fn {localized_name}({args}) -> String {{\n    if {language_param} == primary_lang {{\n        {canonical_expression}\n    }} else {{\n        {prefixed_name}({prefixed_args})\n    }}\n}}\n"
+    )
+}
+
+fn helper_params(params: &[RouteParam]) -> String {
+    params
+        .iter()
+        .map(|param| format!("{}: impl std::fmt::Display", param.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn route_helper_params(route: &Route) -> String {
+    route
+        .params
+        .iter()
+        .map(|param| format!("{}: impl std::fmt::Display", param.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn localized_helper_params(route: &Route, language_param: &str) -> String {
+    let mut params = vec![
+        format!("{language_param}: &str"),
+        "primary_lang: &str".to_string(),
+    ];
+
+    if let Some(contract) = &route.contract {
+        params.push(format!("params: &{}", contract.type_path));
+    } else {
+        params.extend(
+            route
+                .params
+                .iter()
+                .map(|param| format!("{}: impl std::fmt::Display", param.name)),
+        );
+    }
+
+    params.join(", ")
+}
+
+fn helper_args(params: &[RouteParam]) -> String {
+    params
+        .iter()
+        .map(|param| param.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn path_expression_from_template(path: &str) -> String {
@@ -1047,6 +904,40 @@ fn path_expression_from_template(path: &str) -> String {
     format!("format!({template:?}, {encoded_params})")
 }
 
+fn typed_path_expression_from_template(
+    path: &str,
+    value_name: &str,
+    contract: &RouteContract,
+) -> String {
+    let mut params = Vec::new();
+    let template = path
+        .split('/')
+        .map(|segment| {
+            if let Some(param) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                params.push(param.to_string());
+                "{}".to_string()
+            } else {
+                segment.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let encoded_params = params
+        .iter()
+        .map(|param| {
+            if contract.fields.iter().any(|field| field.name == *param) {
+                format!("percent_encode(&{value_name}.{param}.to_string())")
+            } else {
+                format!("percent_encode(&{param}.to_string())")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("format!({template:?}, {encoded_params})")
+}
+
 fn prefixed_route_path(mount: &Mount, path: &str) -> Option<String> {
     let language_param = mount.language_param.as_deref()?;
     Some(if path == "/" {
@@ -1061,14 +952,6 @@ fn optional_string_literal(value: Option<&str>) -> String {
         Some(value) => format!("Some({value:?})"),
         None => "None".to_string(),
     }
-}
-
-fn trim_trailing_slash() -> String {
-    r#"fn trim_trailing_slash(value: &str) -> &str {
-    value.strip_suffix('/').unwrap_or(value)
-}
-"#
-    .to_string()
 }
 
 fn indent_lines(value: &str, spaces: usize) -> String {
@@ -1086,7 +969,7 @@ fn indent_lines(value: &str, spaces: usize) -> String {
         .join("\n")
 }
 
-fn walk_pages(root: &Path) -> Result<Vec<PathBuf>, DiscoverError> {
+fn walk_pages(root: &StdPath) -> Result<Vec<PathBuf>, DiscoverError> {
     let entries = fs::read_dir(root).map_err(|_| DiscoverError::PagesDirectoryUnreadable {
         path: root.to_path_buf(),
     })?;
@@ -1109,7 +992,7 @@ fn walk_pages(root: &Path) -> Result<Vec<PathBuf>, DiscoverError> {
     Ok(paths)
 }
 
-fn should_ignore_file(mount: &Mount, file: &Path) -> bool {
+fn should_ignore_file(mount: &Mount, file: &StdPath) -> bool {
     if file.extension().is_none_or(|extension| extension != "rs") {
         return true;
     }
@@ -1133,7 +1016,7 @@ fn should_ignore_file(mount: &Mount, file: &Path) -> bool {
     relative_parts(&mount.pages, file).is_ok_and(|parts| parts.iter().any(|part| part == "shared"))
 }
 
-fn route_from_file(mount: &Mount, source_file: &Path) -> Result<Route, DiscoverError> {
+fn route_from_file(mount: &Mount, source_file: &StdPath) -> Result<Route, DiscoverError> {
     let raw_segments = raw_segments(mount, source_file)?;
 
     if raw_segments.iter().any(|segment| segment == "all_") {
@@ -1169,6 +1052,7 @@ fn route_from_file(mount: &Mount, source_file: &Path) -> Result<Route, DiscoverE
 
     let handler_name = handler_name_for(mount, &raw_segments);
     let handler_path = format!("{module_path}::{handler_name}");
+    let contract = route_contract(source_file, &module_path, &handler_name, &params)?;
 
     Ok(Route {
         kind: route_kind(&route_segments),
@@ -1183,10 +1067,11 @@ fn route_from_file(mount: &Mount, source_file: &Path) -> Result<Route, DiscoverE
         handler_name,
         handler_path,
         name,
+        contract,
     })
 }
 
-fn raw_segments(mount: &Mount, source_file: &Path) -> Result<Vec<String>, DiscoverError> {
+fn raw_segments(mount: &Mount, source_file: &StdPath) -> Result<Vec<String>, DiscoverError> {
     let relative = source_file.strip_prefix(&mount.pages).map_err(|_| {
         DiscoverError::InvalidPageModulePath {
             source_file: source_file.to_path_buf(),
@@ -1324,7 +1209,7 @@ fn pattern_path(path: &str) -> String {
         .join("/")
 }
 
-fn not_found_route(mount: &Mount, source_file: &Path, module_path: String) -> Route {
+fn not_found_route(mount: &Mount, source_file: &StdPath, module_path: String) -> Route {
     let segments = vec![RouteSegment::Static("not_found".to_string())];
     let handler_name = handler_name_for(mount, &["not_found_".to_string()]);
     let handler_path = format!("{module_path}::{handler_name}");
@@ -1333,7 +1218,7 @@ fn not_found_route(mount: &Mount, source_file: &Path, module_path: String) -> Ro
         kind: RouteKind::NotFound,
         endpoint: Endpoint::Page,
         method: HttpMethod::Get,
-        name: "NotFound".to_string(),
+        name: "not_found_".to_string(),
         helper_name: "not_found".to_string(),
         path: route_path(&mount.route_root, &segments),
         segments,
@@ -1342,26 +1227,7 @@ fn not_found_route(mount: &Mount, source_file: &Path, module_path: String) -> Ro
         module_path,
         handler_name,
         handler_path,
-    }
-}
-
-fn synthetic_not_found_route(mount: &Mount) -> Route {
-    let source_file = mount.pages.join("not_found_.rs");
-    let segments = vec![RouteSegment::Static("not_found".to_string())];
-
-    Route {
-        kind: RouteKind::NotFound,
-        endpoint: Endpoint::Page,
-        method: HttpMethod::Get,
-        name: "NotFound".to_string(),
-        helper_name: "not_found".to_string(),
-        path: route_path(&mount.route_root, &segments),
-        segments,
-        params: Vec::new(),
-        source_file,
-        module_path: String::new(),
-        handler_name: String::new(),
-        handler_path: String::new(),
+        contract: None,
     }
 }
 
@@ -1391,18 +1257,17 @@ fn route_action_handler_name(segment: &str) -> String {
 }
 
 fn route_name(raw_segments: &[String]) -> String {
-    let words = raw_segments
+    let name = raw_segments
         .iter()
         .filter(|segment| segment.as_str() != "index")
-        .flat_map(|segment| segment.trim_end_matches('_').split('_'))
-        .filter(|word| !word.is_empty())
-        .map(capitalize)
-        .collect::<String>();
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("/");
 
-    if words.is_empty() {
-        "Home".to_string()
+    if name.is_empty() {
+        "home".to_string()
     } else {
-        words
+        name
     }
 }
 
@@ -1410,7 +1275,7 @@ fn helper_name(raw_segments: &[String]) -> String {
     let helper = raw_segments
         .iter()
         .filter(|segment| segment.as_str() != "index")
-        .map(|segment| segment.trim_end_matches('_'))
+        .map(String::as_str)
         .collect::<Vec<_>>()
         .join("_");
 
@@ -1421,15 +1286,7 @@ fn helper_name(raw_segments: &[String]) -> String {
     }
 }
 
-fn capitalize(word: &str) -> String {
-    let mut chars = word.chars();
-    match chars.next() {
-        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
-fn module_path(mount: &Mount, source_file: &Path) -> Result<String, DiscoverError> {
+fn module_path(mount: &Mount, source_file: &StdPath) -> Result<String, DiscoverError> {
     let relative = source_file.strip_prefix(&mount.pages).map_err(|_| {
         DiscoverError::InvalidPageModulePath {
             source_file: source_file.to_path_buf(),
@@ -1446,7 +1303,10 @@ fn module_path(mount: &Mount, source_file: &Path) -> Result<String, DiscoverErro
     Ok(parts.join("::"))
 }
 
-fn validate_raw_segments(source_file: &Path, raw_segments: &[String]) -> Result<(), DiscoverError> {
+fn validate_raw_segments(
+    source_file: &StdPath,
+    raw_segments: &[String],
+) -> Result<(), DiscoverError> {
     for (index, segment) in raw_segments.iter().enumerate() {
         if !is_valid_module_segment(segment) {
             return Err(DiscoverError::InvalidPageSegment {
@@ -1467,7 +1327,7 @@ fn validate_raw_segments(source_file: &Path, raw_segments: &[String]) -> Result<
 }
 
 fn validate_file_is_not_namespace_parent(
-    source_file: &Path,
+    source_file: &StdPath,
     raw_segments: &[String],
 ) -> Result<(), DiscoverError> {
     let Some(segment) = raw_segments.last() else {
@@ -1504,7 +1364,7 @@ fn is_reserved_page_segment(raw_segments: &[String], index: usize) -> bool {
     }
 }
 
-fn validate_params(source_file: &Path, params: &[RouteParam]) -> Result<(), DiscoverError> {
+fn validate_params(source_file: &StdPath, params: &[RouteParam]) -> Result<(), DiscoverError> {
     let mut seen = BTreeSet::new();
 
     for param in params {
@@ -1524,6 +1384,183 @@ fn validate_params(source_file: &Path, params: &[RouteParam]) -> Result<(), Disc
     }
 
     Ok(())
+}
+
+fn route_contract(
+    source_file: &StdPath,
+    module_path: &str,
+    handler_name: &str,
+    params: &[RouteParam],
+) -> Result<Option<RouteContract>, DiscoverError> {
+    if params.is_empty() {
+        return Ok(None);
+    }
+
+    let source =
+        fs::read_to_string(source_file).map_err(|_| DiscoverError::PageFileUnreadable {
+            source_file: source_file.to_path_buf(),
+        })?;
+    let parsed = syn::parse_file(&source).map_err(|error| DiscoverError::InvalidRouteContract {
+        source_file: source_file.to_path_buf(),
+        message: format!("could not parse Rust source: {error}"),
+    })?;
+
+    let Some(item_struct) = parsed.items.iter().find_map(|item| match item {
+        syn::Item::Struct(item_struct) if item_struct.ident == "RouteParams" => Some(item_struct),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+
+    if !is_generated_visible(&item_struct.vis) {
+        return Err(DiscoverError::InvalidRouteContract {
+            source_file: source_file.to_path_buf(),
+            message: "`RouteParams` must be `pub(crate)` or `pub` so generated helpers can use it"
+                .to_string(),
+        });
+    }
+
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return Err(DiscoverError::InvalidRouteContract {
+            source_file: source_file.to_path_buf(),
+            message: "`RouteParams` must use named fields".to_string(),
+        });
+    };
+
+    let mut contract_fields = Vec::new();
+    for field in &fields.named {
+        if !is_generated_visible(&field.vis) {
+            return Err(DiscoverError::InvalidRouteContract {
+                source_file: source_file.to_path_buf(),
+                message: "`RouteParams` fields must be `pub(crate)` or `pub` so generated helpers can use them".to_string(),
+            });
+        }
+
+        let Some(ident) = &field.ident else {
+            return Err(DiscoverError::InvalidRouteContract {
+                source_file: source_file.to_path_buf(),
+                message: "`RouteParams` must use named fields".to_string(),
+            });
+        };
+
+        contract_fields.push(RouteContractField {
+            name: ident.to_string(),
+            type_name: field.ty.to_token_stream().to_string(),
+        });
+    }
+
+    validate_route_contract_fields(source_file, params, &contract_fields)?;
+
+    if !handler_receives_route_params(&parsed, handler_name) {
+        return Err(DiscoverError::InvalidRouteContract {
+            source_file: source_file.to_path_buf(),
+            message: format!(
+                "`RouteParams` is declared, so handler `{handler_name}` must receive `proute::Path<RouteParams>`"
+            ),
+        });
+    }
+
+    Ok(Some(RouteContract {
+        type_path: format!("{module_path}::RouteParams"),
+        fields: contract_fields,
+    }))
+}
+
+fn handler_receives_route_params(parsed: &syn::File, handler_name: &str) -> bool {
+    let Some(function) = parsed.items.iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == handler_name => Some(function),
+        _ => None,
+    }) else {
+        return false;
+    };
+
+    function.sig.inputs.iter().any(|arg| match arg {
+        syn::FnArg::Typed(pat_type) => type_is_proute_route_params_path(&pat_type.ty),
+        syn::FnArg::Receiver(_) => false,
+    })
+}
+
+fn type_is_proute_route_params_path(ty: &syn::Type) -> bool {
+    let syn::Type::Path(type_path) = ty else {
+        return false;
+    };
+
+    let mut segments = type_path.path.segments.iter().collect::<Vec<_>>();
+    let Some(last) = segments.pop() else {
+        return false;
+    };
+    let Some(previous) = segments.pop() else {
+        return false;
+    };
+
+    if previous.ident != "proute" || last.ident != "Path" {
+        return false;
+    }
+
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return false;
+    };
+
+    args.args.iter().any(|arg| match arg {
+        syn::GenericArgument::Type(syn::Type::Path(inner)) => inner
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "RouteParams"),
+        _ => false,
+    })
+}
+
+fn validate_route_contract_fields(
+    source_file: &StdPath,
+    params: &[RouteParam],
+    fields: &[RouteContractField],
+) -> Result<(), DiscoverError> {
+    let param_names = params
+        .iter()
+        .map(|param| param.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let field_names = fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<BTreeSet<_>>();
+
+    if param_names == field_names {
+        return Ok(());
+    }
+
+    let missing = param_names
+        .difference(&field_names)
+        .copied()
+        .collect::<Vec<_>>();
+    let extra = field_names
+        .difference(&param_names)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut parts = Vec::new();
+
+    if !missing.is_empty() {
+        parts.push(format!("missing fields for params: {}", missing.join(", ")));
+    }
+
+    if !extra.is_empty() {
+        parts.push(format!(
+            "extra fields without route params: {}",
+            extra.join(", ")
+        ));
+    }
+
+    Err(DiscoverError::InvalidRouteContract {
+        source_file: source_file.to_path_buf(),
+        message: parts.join("; "),
+    })
+}
+
+fn is_generated_visible(vis: &syn::Visibility) -> bool {
+    matches!(
+        vis,
+        syn::Visibility::Public(_) | syn::Visibility::Restricted(_)
+    )
 }
 
 fn is_valid_module_segment(segment: &str) -> bool {
@@ -1771,7 +1808,7 @@ fn normalize_root(route_root: &str) -> String {
     }
 }
 
-fn relative_parts(root: &Path, file: &Path) -> Result<Vec<String>, ()> {
+fn relative_parts(root: &StdPath, file: &StdPath) -> Result<Vec<String>, ()> {
     let relative = file.strip_prefix(root).map_err(|_| ())?;
     Ok(relative
         .components()
@@ -1815,17 +1852,17 @@ mod tests {
         assert_eq!(
             table,
             [
-                "GET / Home crate::pages::index",
-                "GET /orders Orders crate::pages::orders::index",
-                "POST /orders OrdersCreate crate::pages::orders::create",
-                "GET /orders/export.csv OrdersExport crate::pages::orders::export",
-                "GET /orders/items.json OrdersItems crate::pages::orders::items",
-                "GET /orders/new OrdersNew crate::pages::orders::new",
-                "GET /orders/{order_id} OrdersOrderId crate::pages::orders::order_id_::index",
-                "POST /orders/{order_id} OrdersOrderIdUpdate crate::pages::orders::order_id_::update",
-                "POST /orders/{order_id}/delete OrdersOrderIdDelete crate::pages::orders::order_id_::delete",
-                "GET /orders/{order_id}/edit OrdersOrderIdEdit crate::pages::orders::order_id_::edit",
-                "GET /not_found NotFound crate::pages::not_found_",
+                "GET / home crate::pages::index",
+                "GET /orders orders crate::pages::orders::index",
+                "POST /orders orders/create crate::pages::orders::create",
+                "GET /orders/export.csv orders/export crate::pages::orders::export",
+                "GET /orders/items.json orders/items crate::pages::orders::items",
+                "GET /orders/new orders/new crate::pages::orders::new",
+                "GET /orders/{order_id} orders/order_id_ crate::pages::orders::order_id_::index",
+                "POST /orders/{order_id} orders/order_id_/update crate::pages::orders::order_id_::update",
+                "POST /orders/{order_id}/delete orders/order_id_/delete crate::pages::orders::order_id_::delete",
+                "GET /orders/{order_id}/edit orders/order_id_/edit crate::pages::orders::order_id_::edit",
+                "GET /not_found not_found_ crate::pages::not_found_",
             ]
         );
     }
@@ -1858,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_file_targets_routes_directory() {
+    fn generated_file_targets_proute_directory() {
         let fixture = Fixture::new("generated_path");
         fixture.write("index.rs");
         fixture.write("not_found_.rs");
@@ -1867,19 +1904,18 @@ mod tests {
         let mount_routes = discover_mount(fixture.mount().with_language_param("lang")).unwrap();
         let generated = generate_mount_file(&mount_routes);
 
-        assert_eq!(generated.path, PathBuf::from("routes/public.rs"));
+        assert_eq!(generated.path, PathBuf::from("proute/public.rs"));
         assert!(generated.contents.contains("//// mount: public"));
-        assert!(generated.contents.contains("pub enum Route"));
         assert!(generated.contents.contains("pub const ROUTES"));
         assert!(
             generated
                 .contents
-                .contains("OrdersOrderId { order_id: String }")
+                .contains("helper_name: \"orders_order_id_\"")
         );
         assert!(
             generated
                 .contents
-                .contains("pub fn orders_order_id(order_id: impl std::fmt::Display) -> String")
+                .contains("pub fn orders_order_id_(order_id: impl std::fmt::Display) -> String")
         );
         assert!(
             generated
@@ -1913,12 +1949,12 @@ mod tests {
         assert!(
             generated
                 .contents
-                .contains("pub fn route_to_prefixed_path(route: &Route, lang: &str) -> String")
+                .contains("pub fn prefixed_orders_order_id_(lang: impl std::fmt::Display, order_id: impl std::fmt::Display) -> String")
         );
         assert!(
             generated
                 .contents
-                .contains("pub fn route_to_localized_path(route: &Route, lang: &str, primary_lang: &str) -> String")
+                .contains("pub fn localized_orders_order_id_(lang: &str, primary_lang: &str, order_id: impl std::fmt::Display) -> String")
         );
         assert!(
             generated
@@ -1962,6 +1998,135 @@ mod tests {
     }
 
     #[test]
+    fn generated_helpers_use_page_local_route_contracts() {
+        let fixture = Fixture::new("typed_helpers");
+        fixture.write("index.rs");
+        fixture.write_source(
+            "orders/order_id_/index.rs",
+            r#"
+pub(crate) struct RouteParams {
+    pub(crate) order_id: i64,
+}
+
+pub(crate) async fn handler(proute::Path(params): proute::Path<RouteParams>) {
+    let _ = params.order_id;
+}
+"#,
+        );
+
+        let mount_routes = discover_mount(fixture.mount().with_language_param("lang")).unwrap();
+        let generated = generate_mount_module(&mount_routes);
+
+        assert!(generated.contains(
+            "pub fn orders_order_id_(params: &crate::pages::orders::order_id_::index::RouteParams) -> String"
+        ));
+        assert!(generated.contains("percent_encode(&params.order_id.to_string())"));
+        assert!(generated.contains(
+            "pub fn localized_orders_order_id_(lang: &str, primary_lang: &str, params: &crate::pages::orders::order_id_::index::RouteParams) -> String"
+        ));
+
+        let source_path = fixture.root.join("generated_typed_helpers.rs");
+        fs::write(
+            &source_path,
+            generated_typed_helper_compile_wrapper(&generated),
+        )
+        .unwrap();
+
+        let binary_path = fixture.root.join("generated_typed_helpers");
+        let compile = std::process::Command::new("rustc")
+            .arg("--edition=2024")
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&binary_path)
+            .output()
+            .unwrap();
+
+        assert!(
+            compile.status.success(),
+            "generated typed helper binary did not compile\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let run = std::process::Command::new(binary_path).output().unwrap();
+
+        assert!(
+            run.status.success(),
+            "generated typed helper binary failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    #[test]
+    fn route_params_contract_requires_handler_receiver() {
+        let fixture = Fixture::new("typed_handler_receiver");
+        fixture.write("index.rs");
+        fixture.write_source(
+            "orders/order_id_/index.rs",
+            r#"
+pub(crate) struct RouteParams {
+    pub(crate) order_id: i64,
+}
+
+pub(crate) async fn handler() {}
+"#,
+        );
+
+        let error = discover_mount(fixture.mount()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DiscoverError::InvalidRouteContract {
+                source_file,
+                message,
+            } if source_file.ends_with("orders/order_id_/index.rs")
+                && message.contains("must receive `proute::Path<RouteParams>`")
+        ));
+    }
+
+    #[tokio::test]
+    async fn path_extractor_maps_typed_param_parse_failures_to_not_found() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        #[derive(serde::Deserialize)]
+        struct RouteParams {
+            id: i64,
+        }
+
+        async fn handler(Path(params): Path<RouteParams>) -> String {
+            params.id.to_string()
+        }
+
+        let app = axum::Router::new().route("/orders/{id}", axum::routing::get(handler));
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let bad_param = app
+            .oneshot(
+                Request::builder()
+                    .uri("/orders/nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_param.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
     fn generated_router_module_compiles_with_stub_axum() {
         let fixture = Fixture::new("generated_router_compiles");
         fixture.write("index.rs");
@@ -1995,48 +2160,6 @@ mod tests {
             "generated router module did not compile\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[test]
-    fn generated_parser_handles_methods_and_percent_decoded_params() {
-        let fixture = Fixture::new("generated_parser");
-        fixture.write("index.rs");
-        fixture.write("orders/index.rs");
-        fixture.write("orders/create.rs");
-        fixture.write("orders/order_id_/index.rs");
-
-        let mount_routes = discover_mount(fixture.mount().with_language_param("lang")).unwrap();
-        let source_path = fixture.root.join("generated_parser.rs");
-        fs::write(
-            &source_path,
-            generated_parser_runtime_wrapper(&generate_mount_module(&mount_routes)),
-        )
-        .unwrap();
-
-        let binary_path = fixture.root.join("generated_parser");
-        let compile = std::process::Command::new("rustc")
-            .arg("--edition=2024")
-            .arg(&source_path)
-            .arg("-o")
-            .arg(&binary_path)
-            .output()
-            .unwrap();
-
-        assert!(
-            compile.status.success(),
-            "generated parser binary did not compile\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&compile.stdout),
-            String::from_utf8_lossy(&compile.stderr)
-        );
-
-        let run = std::process::Command::new(binary_path).output().unwrap();
-
-        assert!(
-            run.status.success(),
-            "generated parser binary failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
         );
     }
 
@@ -2110,26 +2233,26 @@ mod tests {
     }
 
     #[test]
-    fn write_mount_file_writes_under_routes_directory() {
+    fn write_mount_file_writes_under_proute_directory() {
         let fixture = Fixture::new("write_mount_file");
         fixture.write("index.rs");
         fixture.write("not_found_.rs");
 
         let output_root = fixture.root.join("generated");
         let generated = write_mount_file(&output_root, fixture.mount()).unwrap();
-        let output_path = output_root.join("routes/public.rs");
+        let output_path = output_root.join("proute/public.rs");
 
-        assert_eq!(generated.path, PathBuf::from("routes/public.rs"));
+        assert_eq!(generated.path, PathBuf::from("proute/public.rs"));
         assert!(output_path.exists());
         assert!(
             fs::read_to_string(output_path)
                 .unwrap()
-                .contains("pub enum Route")
+                .contains("pub const ROUTES")
         );
     }
 
     #[test]
-    fn write_mount_files_writes_mount_modules_and_routes_mod() {
+    fn write_mount_files_writes_mount_modules_and_proute_mod() {
         let fixture = Fixture::new("write_mount_files");
         let public_pages = fixture.root.join("public_pages");
         let admin_pages = fixture.root.join("admin_pages");
@@ -2158,15 +2281,15 @@ mod tests {
         assert_eq!(
             paths,
             [
-                PathBuf::from("routes/public.rs"),
-                PathBuf::from("routes/admin.rs"),
-                PathBuf::from("routes/mod.rs"),
+                PathBuf::from("proute/public.rs"),
+                PathBuf::from("proute/admin.rs"),
+                PathBuf::from("proute/mod.rs"),
             ]
         );
-        assert!(output_root.join("routes/public.rs").exists());
-        assert!(output_root.join("routes/admin.rs").exists());
+        assert!(output_root.join("proute/public.rs").exists());
+        assert!(output_root.join("proute/admin.rs").exists());
         assert_eq!(
-            fs::read_to_string(output_root.join("routes/mod.rs")).unwrap(),
+            fs::read_to_string(output_root.join("proute/mod.rs")).unwrap(),
             "//// Generated. Do not edit.\n\npub mod public;\npub mod admin;\n"
         );
     }
@@ -2504,9 +2627,7 @@ pub(crate) async fn new(
             .collect::<Vec<_>>();
 
         assert_eq!(route_paths, ["/"]);
-        assert!(generated.contains("pub enum Route {\n    Home,\n    NotFound,\n}"));
-        assert!(generated.contains("_ => Route::NotFound,"));
-        assert!(generated.contains("Route::NotFound => \"/not_found\".to_string(),"));
+        assert!(generated.contains("pub fn home() -> &'static str"));
         assert!(!generated.contains("path: \"/not_found\""));
         assert!(!generated.contains(".route(\"/not_found\""));
     }
@@ -2563,7 +2684,7 @@ pub(crate) async fn new(
         }
     }
 
-    fn write_fixture_file(root: &Path, relative: &str) {
+    fn write_fixture_file(root: &StdPath, relative: &str) {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, "pub(crate) async fn handler() {}\n").unwrap();
@@ -2659,63 +2780,40 @@ mod pages {{
         )
     }
 
-    fn generated_parser_runtime_wrapper(generated: &str) -> String {
+    fn generated_typed_helper_compile_wrapper(generated: &str) -> String {
         format!(
             r#"
+mod pages {{
+    pub mod index {{
+        pub async fn handler() {{}}
+    }}
+
+    pub mod orders {{
+        pub mod order_id_ {{
+            pub mod index {{
+                pub(crate) struct RouteParams {{
+                    pub(crate) order_id: i64,
+                }}
+
+                pub async fn handler() {{}}
+            }}
+        }}
+    }}
+}}
+
 {generated}
 
 fn main() {{
-    assert_eq!(parse_request("GET", "/"), Route::Home);
-    assert_eq!(parse_request("GET", "/orders"), Route::Orders);
-    assert_eq!(parse_request("POST", "/orders"), Route::OrdersCreate);
+    let params = pages::orders::order_id_::index::RouteParams {{ order_id: 123 }};
+    assert_eq!(orders_order_id_(&params), "/orders/123");
+    assert_eq!(prefixed_orders_order_id_("fr", &params), "/fr/orders/123");
     assert_eq!(
-        parse_request("GET", "/orders/a%2Fb?tab=details"),
-        Route::OrdersOrderId {{
-            order_id: "a/b".to_string(),
-        }}
+        localized_orders_order_id_("en", "en", &params),
+        "/orders/123"
     );
     assert_eq!(
-        route_to_path(&Route::OrdersOrderId {{
-            order_id: "a/b".to_string(),
-        }}),
-        "/orders/a%2Fb".to_string()
-    );
-    assert_eq!(parse_request("DELETE", "/orders/a%2Fb"), Route::NotFound);
-    assert_eq!(parse_request("GET", "/orders/%GG"), Route::NotFound);
-    assert_eq!(route_to_path(&Route::NotFound), "/not_found".to_string());
-    assert_eq!(
-        route_to_prefixed_path(&Route::NotFound, "fr"),
-        "/fr/not_found".to_string()
-    );
-    assert_eq!(
-        parse_localized_request("GET", "/orders"),
-        ParsedRequest {{
-            route: Route::Orders,
-            lang: None,
-        }}
-    );
-    assert_eq!(
-        parse_localized_request("GET", "/fr/orders/a%2Fb?tab=details"),
-        ParsedRequest {{
-            route: Route::OrdersOrderId {{
-                order_id: "a/b".to_string(),
-            }},
-            lang: Some("fr".to_string()),
-        }}
-    );
-    assert_eq!(
-        parse_localized_request("POST", "/fr/orders"),
-        ParsedRequest {{
-            route: Route::OrdersCreate,
-            lang: Some("fr".to_string()),
-        }}
-    );
-    assert_eq!(
-        parse_localized_request("GET", "/%GG/orders"),
-        ParsedRequest {{
-            route: Route::NotFound,
-            lang: None,
-        }}
+        localized_orders_order_id_("fr", "en", &params),
+        "/fr/orders/123"
     );
 }}
 "#

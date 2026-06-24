@@ -23,15 +23,12 @@ Rules:
 - File paths are routes.
 - Trailing underscores mark dynamic path params. The segment name before the
   underscore becomes the param name.
-- Dynamic path params are always strings. `id_`, `slug_`, `product_type_`, and
-  `line_item_id_` all capture one decoded path segment as `String`; page
-  modules own any parsing, casting, lookup, or validation.
+- Dynamic segment names do not imply types. `id_`, `slug_`, `product_type_`,
+  and `line_item_id_` are names only.
 - GET is the default.
 - `create.rs`, `update.rs`, and `delete.rs` are reserved mutation endpoints.
 - `index.rs` owns the current directory path. At the mount root, it owns `/`.
 - `not_found_.rs` is optional. When present, it owns the mount 404 route.
-- `Route::NotFound` is always generated as the parser fallback, even without a
-  `not_found_.rs` page file.
 - `all_.rs` is reserved for future catch-all routing.
 - `mod.rs` and every `shared/` directory are ignored.
 - `show.rs` is rejected. Use `orders/order_id_/index.rs`.
@@ -39,22 +36,25 @@ Rules:
   `orders/index.rs` instead of `orders.rs`.
 - `create`, `update`, and `delete` cannot be used as intermediate path
   segments. They are action files only.
+- Two dynamic child segments at the same directory level are rejected because
+  both would match the same path shape. Static siblings are checked first and
+  may live beside one dynamic fallback.
 
 ## Generated Layout
 
-The tool name is `proute`, but generated app code lives under `routes`:
+The generated app code lives under `proute`:
 
 ```text
-src/generated/routes/mod.rs
-src/generated/routes/public.rs
-src/generated/routes/admin.rs
+src/generated/proute/mod.rs
+src/generated/proute/public.rs
+src/generated/proute/admin.rs
 ```
 
 That keeps imports focused on the app concept:
 
 ```rust
-crate::generated::routes::public
-crate::generated::routes::admin
+crate::generated::proute::public
+crate::generated::proute::admin
 ```
 
 ## Build Script Usage
@@ -81,6 +81,65 @@ fn main() {
 Canonical paths are prefix-free. When a mount has a language param, generated
 helpers also expose language-prefixed paths and localized helpers that omit the
 prefix for the primary language.
+
+## URL Helpers
+
+Generated helper names preserve dynamic trailing underscores:
+
+```rust
+routes::public::orders_order_id_(123)
+// /orders/123
+
+routes::public::orders_order_id__line_items_line_item_id_(123, 456)
+// /orders/123/line_items/456
+```
+
+Untyped helpers accept `impl std::fmt::Display` as a URL-generation
+convenience. That does not give `id_` or any other segment a semantic type; it
+only serializes a value into a path segment before percent-encoding it.
+
+With a language param, proute also generates:
+
+```rust
+routes::public::prefixed_orders_order_id_("fr", 123)
+// /fr/orders/123
+
+routes::public::localized_orders_order_id_("en", "en", 123)
+// /orders/123
+
+routes::public::localized_orders_order_id_("fr", "en", 123)
+// /fr/orders/123
+```
+
+## Typed Route Contracts
+
+Parameterized page modules may define a page-local `RouteParams` contract:
+
+```rust
+#[derive(proute::serde::Deserialize)]
+pub(crate) struct RouteParams {
+    pub(crate) order_id: i64,
+}
+
+pub(crate) async fn index(
+    proute::Path(params): proute::Path<RouteParams>,
+) -> impl axum::response::IntoResponse {
+    // params.order_id is already typed here.
+}
+```
+
+When `RouteParams` exists, proute validates that its fields exactly match the
+dynamic path params for the route. The struct and fields must be `pub(crate)`
+or `pub` so generated helpers can use the same contract:
+
+```rust
+routes::public::orders_order_id_(&RouteParams { order_id: 123 })
+```
+
+`proute::Path<T>` delegates to Axum's typed path deserializer and turns any path
+deserialization failure into `404 Not Found`. A bad typed route param means the
+URL does not satisfy the route contract, so handlers do not need local parsing
+branches for route shape errors.
 
 ## Handler Convention
 
@@ -129,37 +188,5 @@ pub fn prefixed_routes() -> axum::Router<crate::app::AppState>
 
 `prefixed_routes` is generated only for mounts with a language param.
 
-## Parsing
-
-Generated modules expose method-aware parsing:
-
-```rust
-pub fn parse_request(method: &str, raw_path: &str) -> Route
-```
-
-The method is required because HTTP actions can share a path with GET pages:
-
-```text
-GET  /orders -> Route::Orders
-POST /orders -> Route::OrdersCreate
-```
-
-Dynamic path params are percent-decoded after path segmentation, so encoded
-slashes stay inside a string param.
-
 Generated path helpers percent-encode dynamic params, so a value like `a/b`
-round-trips as `/orders/a%2Fb`.
-
-For mounts with a language param, generated modules also expose:
-
-```rust
-pub struct ParsedRequest {
-    pub route: Route,
-    pub lang: Option<String>,
-}
-
-pub fn parse_localized_request(method: &str, raw_path: &str) -> ParsedRequest
-```
-
-Localized parsing tries the canonical path first. `/orders` returns
-`lang: None`, while `/fr/orders` returns `lang: Some("fr")`.
+is generated as `/orders/a%2Fb`.
