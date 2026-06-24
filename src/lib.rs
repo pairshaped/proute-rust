@@ -1234,8 +1234,23 @@ fn route_segments(raw_segments: &[String], endpoint: &Endpoint) -> Vec<RouteSegm
 
     path_segments
         .iter()
-        .map(|segment| route_segment(segment))
+        .enumerate()
+        .map(|(index, segment)| {
+            if index + 1 == path_segments.len() {
+                route_leaf_segment(segment)
+            } else {
+                route_segment(segment)
+            }
+        })
         .collect()
+}
+
+fn route_leaf_segment(segment: &str) -> RouteSegment {
+    match segment {
+        "export" => RouteSegment::Static("export.csv".to_string()),
+        "items" => RouteSegment::Static("items.json".to_string()),
+        _ => route_segment(segment),
+    }
 }
 
 fn route_segment(segment: &str) -> RouteSegment {
@@ -1362,8 +1377,16 @@ fn handler_name_for(mount: &Mount, raw_segments: &[String]) -> String {
         HandlerNames::Fixed(handler_name) => handler_name.clone(),
         HandlerNames::RouteAction => raw_segments
             .last()
-            .map(|segment| segment.trim_end_matches('_').to_string())
+            .map(|segment| route_action_handler_name(segment))
             .unwrap_or_else(|| "index".to_string()),
+    }
+}
+
+fn route_action_handler_name(segment: &str) -> String {
+    match segment {
+        "export" => "export_csv".to_string(),
+        "items" => "items_json".to_string(),
+        _ => segment.trim_end_matches('_').to_string(),
     }
 }
 
@@ -1765,6 +1788,7 @@ mod tests {
         fixture.write("orders/order_id_/update.rs");
         fixture.write("orders/order_id_/delete.rs");
         fixture.write("orders/export.rs");
+        fixture.write("orders/items.rs");
         fixture.write("orders/shared/form.rs");
         fixture.write("orders/mod.rs");
 
@@ -1785,7 +1809,8 @@ mod tests {
                 "GET / Home crate::pages::index",
                 "GET /orders Orders crate::pages::orders::index",
                 "POST /orders OrdersCreate crate::pages::orders::create",
-                "GET /orders/export OrdersExport crate::pages::orders::export",
+                "GET /orders/export.csv OrdersExport crate::pages::orders::export",
+                "GET /orders/items.json OrdersItems crate::pages::orders::items",
                 "GET /orders/new OrdersNew crate::pages::orders::new",
                 "GET /orders/{order_id} OrdersOrderId crate::pages::orders::order_id_::index",
                 "POST /orders/{order_id} OrdersOrderIdUpdate crate::pages::orders::order_id_::update",
@@ -2266,7 +2291,8 @@ mod tests {
             "orders/order_id_/delete.rs",
             "pub(crate) async fn delete() {}\n",
         );
-        fixture.write_source("orders/export.rs", "pub(crate) async fn export() {}\n");
+        fixture.write_source("orders/export.rs", "pub(crate) async fn export_csv() {}\n");
+        fixture.write_source("orders/items.rs", "pub(crate) async fn items_json() {}\n");
 
         let routes = discover_mount(fixture.mount().with_route_action_handler_names())
             .unwrap()
@@ -2282,7 +2308,8 @@ mod tests {
                 "GET / crate::pages::index::index",
                 "GET /orders crate::pages::orders::index::index",
                 "POST /orders crate::pages::orders::create::create",
-                "GET /orders/export crate::pages::orders::export::export",
+                "GET /orders/export.csv crate::pages::orders::export::export_csv",
+                "GET /orders/items.json crate::pages::orders::items::items_json",
                 "GET /orders/new crate::pages::orders::new::new",
                 "GET /orders/{order_id} crate::pages::orders::order_id_::index::index",
                 "POST /orders/{order_id} crate::pages::orders::order_id_::update::update",
