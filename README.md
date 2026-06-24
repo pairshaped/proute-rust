@@ -21,7 +21,11 @@ orders/order_id_/delete.rs     -> POST   /orders/{order_id}/delete
 Rules:
 
 - File paths are routes.
-- Trailing underscores mark dynamic path params.
+- Trailing underscores mark dynamic path params. The segment name before the
+  underscore becomes the param name.
+- Dynamic path params are always strings. `id_`, `slug_`, `product_type_`, and
+  `line_item_id_` all capture one decoded path segment as `String`; page
+  modules own any parsing, casting, lookup, or validation.
 - GET is the default.
 - `create.rs`, `update.rs`, and `delete.rs` are reserved mutation endpoints.
 - `index.rs` owns the current directory path. At the mount root, it owns `/`.
@@ -141,7 +145,7 @@ POST /orders -> Route::OrdersCreate
 ```
 
 Dynamic path params are percent-decoded after path segmentation, so encoded
-slashes stay inside a param.
+slashes stay inside a string param.
 
 Generated path helpers percent-encode dynamic params, so a value like `a/b`
 round-trips as `/orders/a%2Fb`.

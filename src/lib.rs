@@ -1874,6 +1874,11 @@ mod tests {
         assert!(
             generated
                 .contents
+                .contains("OrdersOrderId { order_id: String }")
+        );
+        assert!(
+            generated
+                .contents
                 .contains("pub fn orders_order_id(order_id: impl std::fmt::Display) -> String")
         );
         assert!(
