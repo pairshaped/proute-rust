@@ -141,6 +141,40 @@ deserialization failure into `404 Not Found`. A bad typed route param means the
 URL does not satisfy the route contract, so handlers do not need local parsing
 branches for route shape errors.
 
+Typed helpers serialize contract fields through `proute::ToParam`. Common
+primitive and string types are supported directly. App-specific route param
+types can implement `ToParam` when their URL form differs from their ordinary
+display form.
+
+### Friendly URLs
+
+`proute::FriendlyId<T>` is a Rails-style `to_param` helper for routes that want
+SEO text while parsing only the leading typed id:
+
+```rust
+#[derive(proute::serde::Deserialize)]
+pub(crate) struct RouteParams {
+    pub(crate) order_id: proute::FriendlyId<i64>,
+}
+
+let params = RouteParams {
+    order_id: proute::FriendlyId::new(123, "Summer Curling Registration"),
+};
+
+routes::public::orders_order_id_(&params)
+// /orders/123-summer-curling-registration
+```
+
+On incoming requests, `FriendlyId<i64>` accepts `/orders/123` and
+`/orders/123-any-slug-text`. It parses only the leading `123`; bad leading ids
+fail extraction and become the standard proute 404 through `proute::Path<T>`.
+
+Friendly slug suffixes default to 60 characters. Generation lowercases ASCII
+text, turns separator runs into single hyphens, trims edge hyphens, and cuts at
+a word boundary when practical. Empty slugs fall back to the bare id. Routes
+that need a different suffix length can call `.with_slug_limit(max_chars)` when
+building the helper params.
+
 ## Handler Convention
 
 Each routable module exposes a `handler` function by default:

@@ -3,11 +3,169 @@ use std::fmt;
 use std::fs;
 use std::future::Future;
 use std::path::{Path as StdPath, PathBuf};
+use std::str::FromStr;
 
 use quote::ToTokens;
 
 pub use axum;
 pub use serde;
+
+pub trait ToParam {
+    fn to_param(&self) -> String;
+}
+
+impl ToParam for str {
+    fn to_param(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl ToParam for String {
+    fn to_param(&self) -> String {
+        self.clone()
+    }
+}
+
+impl<T: ToParam + ?Sized> ToParam for &T {
+    fn to_param(&self) -> String {
+        (*self).to_param()
+    }
+}
+
+macro_rules! impl_to_param_display {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl ToParam for $ty {
+                fn to_param(&self) -> String {
+                    self.to_string()
+                }
+            }
+        )*
+    };
+}
+
+impl_to_param_display!(
+    bool, char, i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize,
+);
+
+pub const DEFAULT_FRIENDLY_SLUG_MAX_CHARS: usize = 60;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FriendlyId<T> {
+    pub id: T,
+    pub slug: Option<String>,
+    pub slug_max_chars: usize,
+}
+
+impl<T> FriendlyId<T> {
+    pub fn new(id: T, slug: impl Into<String>) -> Self {
+        Self {
+            id,
+            slug: Some(slug.into()),
+            slug_max_chars: DEFAULT_FRIENDLY_SLUG_MAX_CHARS,
+        }
+    }
+
+    pub fn id_only(id: T) -> Self {
+        Self {
+            id,
+            slug: None,
+            slug_max_chars: DEFAULT_FRIENDLY_SLUG_MAX_CHARS,
+        }
+    }
+
+    pub fn with_slug_limit(mut self, max_chars: usize) -> Self {
+        self.slug_max_chars = max_chars;
+        self
+    }
+}
+
+impl<T: fmt::Display> ToParam for FriendlyId<T> {
+    fn to_param(&self) -> String {
+        let id = self.id.to_string();
+        let Some(slug) = self.slug.as_deref() else {
+            return id;
+        };
+        let suffix = friendly_slug(slug, self.slug_max_chars);
+        if suffix.is_empty() {
+            id
+        } else {
+            format!("{id}-{suffix}")
+        }
+    }
+}
+
+impl<'de, T> serde::Deserialize<'de> for FriendlyId<T>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor<T>(std::marker::PhantomData<T>);
+
+        impl<T> serde::de::Visitor<'_> for Visitor<T>
+        where
+            T: FromStr,
+            T::Err: fmt::Display,
+        {
+            type Value = FriendlyId<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a friendly route parameter with a leading typed id")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let id_text = value.split_once('-').map_or(value, |(id, _)| id);
+                if id_text.is_empty() {
+                    return Err(E::custom("missing leading id"));
+                }
+                let id = id_text.parse::<T>().map_err(E::custom)?;
+                Ok(FriendlyId::id_only(id))
+            }
+        }
+
+        deserializer.deserialize_str(Visitor(std::marker::PhantomData))
+    }
+}
+
+fn friendly_slug(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut slug = String::new();
+    let mut previous_was_separator = true;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            slug.push('-');
+            previous_was_separator = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.chars().count() <= max_chars {
+        return slug;
+    }
+
+    let truncated = slug.chars().take(max_chars).collect::<String>();
+    if let Some((head, _)) = truncated.rsplit_once('-') {
+        if !head.is_empty() {
+            return head.to_string();
+        }
+    }
+    truncated.trim_end_matches('-').to_string()
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Path<T>(pub T);
@@ -927,7 +1085,7 @@ fn typed_path_expression_from_template(
         .iter()
         .map(|param| {
             if contract.fields.iter().any(|field| field.name == *param) {
-                format!("percent_encode(&{value_name}.{param}.to_string())")
+                format!("percent_encode(&proute::ToParam::to_param(&{value_name}.{param}))")
             } else {
                 format!("percent_encode(&{param}.to_string())")
             }
@@ -2020,7 +2178,7 @@ pub(crate) async fn handler(proute::Path(params): proute::Path<RouteParams>) {
         assert!(generated.contains(
             "pub fn orders_order_id_(params: &crate::pages::orders::order_id_::index::RouteParams) -> String"
         ));
-        assert!(generated.contains("percent_encode(&params.order_id.to_string())"));
+        assert!(generated.contains("percent_encode(&proute::ToParam::to_param(&params.order_id))"));
         assert!(generated.contains(
             "pub fn localized_orders_order_id_(lang: &str, primary_lang: &str, params: &crate::pages::orders::order_id_::index::RouteParams) -> String"
         ));
@@ -2055,6 +2213,33 @@ pub(crate) async fn handler(proute::Path(params): proute::Path<RouteParams>) {
             "generated typed helper binary failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    #[test]
+    fn friendly_id_generates_bounded_slugs_and_parses_leading_id() {
+        use serde::Deserialize as _;
+        use serde::de::value::{Error as ValueError, StrDeserializer};
+
+        let param = FriendlyId::new(123, "This is a Long Title, With Punctuation and Words")
+            .with_slug_limit(24);
+        assert_eq!(param.to_param(), "123-this-is-a-long-title");
+
+        let empty = FriendlyId::new(123, "!!!");
+        assert_eq!(empty.to_param(), "123");
+
+        let parsed = FriendlyId::<i64>::deserialize(StrDeserializer::<ValueError>::new(
+            "123-this-is-a-long-title",
+        ))
+        .expect("parse friendly id");
+        assert_eq!(parsed.id, 123);
+
+        assert!(
+            FriendlyId::<i64>::deserialize(StrDeserializer::<ValueError>::new("abc-title"))
+                .is_err()
+        );
+        assert!(
+            FriendlyId::<i64>::deserialize(StrDeserializer::<ValueError>::new("-title")).is_err()
         );
     }
 
@@ -2783,6 +2968,18 @@ mod pages {{
     fn generated_typed_helper_compile_wrapper(generated: &str) -> String {
         format!(
             r#"
+mod proute {{
+    pub trait ToParam {{
+        fn to_param(&self) -> String;
+    }}
+
+    impl ToParam for i64 {{
+        fn to_param(&self) -> String {{
+            self.to_string()
+        }}
+    }}
+}}
+
 mod pages {{
     pub mod index {{
         pub async fn handler() {{}}
