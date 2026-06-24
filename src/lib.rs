@@ -14,6 +14,10 @@ pub trait ToParam {
     fn to_param(&self) -> String;
 }
 
+pub trait IntoParam<T> {
+    fn into_param(self) -> String;
+}
+
 impl ToParam for str {
     fn to_param(&self) -> String {
         self.to_string()
@@ -29,6 +33,30 @@ impl ToParam for String {
 impl<T: ToParam + ?Sized> ToParam for &T {
     fn to_param(&self) -> String {
         (*self).to_param()
+    }
+}
+
+impl<T> IntoParam<T> for T
+where
+    T: ToParam,
+{
+    fn into_param(self) -> String {
+        self.to_param()
+    }
+}
+
+impl<T> IntoParam<T> for &T
+where
+    T: ToParam,
+{
+    fn into_param(self) -> String {
+        self.to_param()
+    }
+}
+
+impl IntoParam<String> for &str {
+    fn into_param(self) -> String {
+        self.to_string()
     }
 }
 
@@ -92,6 +120,15 @@ impl<T: fmt::Display> ToParam for FriendlyId<T> {
         } else {
             format!("{id}-{suffix}")
         }
+    }
+}
+
+impl<T> IntoParam<FriendlyId<T>> for T
+where
+    T: ToParam,
+{
+    fn into_param(self) -> String {
+        self.to_param()
     }
 }
 
@@ -914,10 +951,10 @@ fn localized_helper_name(helper_name: &str) -> String {
 
 fn path_helper(route: &Route, helper_name: &str, path: &str) -> String {
     if let Some(contract) = &route.contract {
-        let expression = typed_path_expression_from_template(path, "params", contract);
+        let args = contract_helper_params(contract);
+        let expression = typed_path_expression_from_template(path, contract);
         return format!(
-            "#[allow(non_snake_case)]\npub fn {helper_name}(params: &{}) -> String {{\n    {expression}\n}}\n",
-            contract.type_path
+            "#[allow(non_snake_case)]\npub fn {helper_name}({args}) -> String {{\n    {expression}\n}}\n"
         );
     }
 
@@ -942,10 +979,10 @@ fn prefixed_path_helper(
     path: &str,
 ) -> String {
     if let Some(contract) = &route.contract {
-        let expression = typed_path_expression_from_template(path, "params", contract);
+        let args = prefixed_contract_helper_params(contract, language_param);
+        let expression = typed_path_expression_from_template(path, contract);
         return format!(
-            "#[allow(non_snake_case)]\npub fn {helper_name}({language_param}: impl std::fmt::Display, params: &{}) -> String {{\n    {expression}\n}}\n",
-            contract.type_path
+            "#[allow(non_snake_case)]\npub fn {helper_name}({args}) -> String {{\n    {expression}\n}}\n"
         );
     }
 
@@ -968,16 +1005,19 @@ fn localized_path_helper(
     route: &Route,
     language_param: &str,
 ) -> String {
-    let canonical_expression = if route.contract.is_some() {
-        format!("{}(params).to_string()", route.helper_name)
+    let canonical_expression = if let Some(contract) = &route.contract {
+        let canonical_args = contract_helper_args(contract);
+        format!("{}({canonical_args}).to_string()", route.helper_name)
     } else if route.params.is_empty() {
         format!("{}().to_string()", route.helper_name)
     } else {
         let canonical_args = helper_args(&route.params);
         format!("{}({canonical_args})", route.helper_name)
     };
-    let prefixed_args = if route.contract.is_some() {
-        format!("{language_param}, params")
+    let prefixed_args = if let Some(contract) = &route.contract {
+        let mut args = vec![language_param.to_string()];
+        args.extend(contract_helper_args_list(contract));
+        args.join(", ")
     } else {
         let mut params = vec![RouteParam {
             name: language_param.to_string(),
@@ -991,6 +1031,29 @@ fn localized_path_helper(
     format!(
         "#[allow(non_snake_case)]\npub fn {localized_name}({args}) -> String {{\n    if {language_param} == primary_lang {{\n        {canonical_expression}\n    }} else {{\n        {prefixed_name}({prefixed_args})\n    }}\n}}\n"
     )
+}
+
+fn contract_helper_params(contract: &RouteContract) -> String {
+    contract
+        .fields
+        .iter()
+        .map(|field| {
+            format!(
+                "{}: impl proute::IntoParam<{}>",
+                field.name, field.type_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn prefixed_contract_helper_params(contract: &RouteContract, language_param: &str) -> String {
+    let mut params = vec![format!("{language_param}: impl std::fmt::Display")];
+    let contract_params = contract_helper_params(contract);
+    if !contract_params.is_empty() {
+        params.push(contract_params);
+    }
+    params.join(", ")
 }
 
 fn helper_params(params: &[RouteParam]) -> String {
@@ -1017,7 +1080,7 @@ fn localized_helper_params(route: &Route, language_param: &str) -> String {
     ];
 
     if let Some(contract) = &route.contract {
-        params.push(format!("params: &{}", contract.type_path));
+        params.push(contract_helper_params(contract));
     } else {
         params.extend(
             route
@@ -1036,6 +1099,18 @@ fn helper_args(params: &[RouteParam]) -> String {
         .map(|param| param.name.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn contract_helper_args(contract: &RouteContract) -> String {
+    contract_helper_args_list(contract).join(", ")
+}
+
+fn contract_helper_args_list(contract: &RouteContract) -> Vec<String> {
+    contract
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect()
 }
 
 fn path_expression_from_template(path: &str) -> String {
@@ -1062,11 +1137,7 @@ fn path_expression_from_template(path: &str) -> String {
     format!("format!({template:?}, {encoded_params})")
 }
 
-fn typed_path_expression_from_template(
-    path: &str,
-    value_name: &str,
-    contract: &RouteContract,
-) -> String {
+fn typed_path_expression_from_template(path: &str, contract: &RouteContract) -> String {
     let mut params = Vec::new();
     let template = path
         .split('/')
@@ -1084,8 +1155,11 @@ fn typed_path_expression_from_template(
     let encoded_params = params
         .iter()
         .map(|param| {
-            if contract.fields.iter().any(|field| field.name == *param) {
-                format!("percent_encode(&proute::ToParam::to_param(&{value_name}.{param}))")
+            if let Some(field) = contract.fields.iter().find(|field| field.name == *param) {
+                format!(
+                    "percent_encode(&proute::IntoParam::<{}>::into_param({param}))",
+                    field.type_name
+                )
             } else {
                 format!("percent_encode(&{param}.to_string())")
             }
@@ -2171,16 +2245,44 @@ pub(crate) async fn handler(proute::Path(params): proute::Path<RouteParams>) {
 }
 "#,
         );
+        fixture.write_source(
+            "products/product_type_/index.rs",
+            r#"
+pub(crate) struct RouteParams {
+    pub(crate) product_type: String,
+}
+
+pub(crate) async fn handler(proute::Path(params): proute::Path<RouteParams>) {
+    let _ = params.product_type;
+}
+"#,
+        );
+        fixture.write_source(
+            "pages/id_/index.rs",
+            r#"
+pub(crate) struct RouteParams {
+    pub(crate) id: proute::FriendlyId<i64>,
+}
+
+pub(crate) async fn handler(proute::Path(params): proute::Path<RouteParams>) {
+    let _ = params.id;
+}
+"#,
+        );
 
         let mount_routes = discover_mount(fixture.mount().with_language_param("lang")).unwrap();
         let generated = generate_mount_module(&mount_routes);
 
+        assert!(
+            generated.contains(
+                "pub fn orders_order_id_(order_id: impl proute::IntoParam<i64>) -> String"
+            )
+        );
+        assert!(
+            generated.contains("percent_encode(&proute::IntoParam::<i64>::into_param(order_id))")
+        );
         assert!(generated.contains(
-            "pub fn orders_order_id_(params: &crate::pages::orders::order_id_::index::RouteParams) -> String"
-        ));
-        assert!(generated.contains("percent_encode(&proute::ToParam::to_param(&params.order_id))"));
-        assert!(generated.contains(
-            "pub fn localized_orders_order_id_(lang: &str, primary_lang: &str, params: &crate::pages::orders::order_id_::index::RouteParams) -> String"
+            "pub fn localized_orders_order_id_(lang: &str, primary_lang: &str, order_id: impl proute::IntoParam<i64>) -> String"
         ));
 
         let source_path = fixture.root.join("generated_typed_helpers.rs");
@@ -2973,9 +3075,68 @@ mod proute {{
         fn to_param(&self) -> String;
     }}
 
+    pub trait IntoParam<T> {{
+        fn into_param(self) -> String;
+    }}
+
     impl ToParam for i64 {{
         fn to_param(&self) -> String {{
             self.to_string()
+        }}
+    }}
+
+    impl ToParam for str {{
+        fn to_param(&self) -> String {{
+            self.to_string()
+        }}
+    }}
+
+    impl ToParam for String {{
+        fn to_param(&self) -> String {{
+            self.clone()
+        }}
+    }}
+
+    impl<T> IntoParam<T> for T
+    where
+        T: ToParam,
+    {{
+        fn into_param(self) -> String {{
+            self.to_param()
+        }}
+    }}
+
+    impl<T> IntoParam<T> for &T
+    where
+        T: ToParam,
+    {{
+        fn into_param(self) -> String {{
+            self.to_param()
+        }}
+    }}
+
+    impl IntoParam<String> for &str {{
+        fn into_param(self) -> String {{
+            self.to_string()
+        }}
+    }}
+
+    pub struct FriendlyId<T> {{
+        pub id: T,
+    }}
+
+    impl<T: ToParam> ToParam for FriendlyId<T> {{
+        fn to_param(&self) -> String {{
+            self.id.to_param()
+        }}
+    }}
+
+    impl<T> IntoParam<FriendlyId<T>> for T
+    where
+        T: ToParam,
+    {{
+        fn into_param(self) -> String {{
+            self.to_param()
         }}
     }}
 }}
@@ -2996,20 +3157,45 @@ mod pages {{
             }}
         }}
     }}
+
+    pub mod products {{
+        pub mod product_type_ {{
+            pub mod index {{
+                pub(crate) struct RouteParams {{
+                    pub(crate) product_type: String,
+                }}
+
+                pub async fn handler() {{}}
+            }}
+        }}
+    }}
+
+    pub mod pages {{
+        pub mod id_ {{
+            pub mod index {{
+                pub(crate) struct RouteParams {{
+                    pub(crate) id: crate::proute::FriendlyId<i64>,
+                }}
+
+                pub async fn handler() {{}}
+            }}
+        }}
+    }}
 }}
 
 {generated}
 
 fn main() {{
-    let params = pages::orders::order_id_::index::RouteParams {{ order_id: 123 }};
-    assert_eq!(orders_order_id_(&params), "/orders/123");
-    assert_eq!(prefixed_orders_order_id_("fr", &params), "/fr/orders/123");
+    assert_eq!(orders_order_id_(123), "/orders/123");
+    assert_eq!(prefixed_orders_order_id_("fr", 123), "/fr/orders/123");
+    assert_eq!(products_product_type_("leagues"), "/products/leagues");
+    assert_eq!(pages_id_(123), "/pages/123");
     assert_eq!(
-        localized_orders_order_id_("en", "en", &params),
+        localized_orders_order_id_("en", "en", 123),
         "/orders/123"
     );
     assert_eq!(
-        localized_orders_order_id_("fr", "en", &params),
+        localized_orders_order_id_("fr", "en", 123),
         "/fr/orders/123"
     );
 }}
