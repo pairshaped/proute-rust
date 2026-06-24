@@ -395,6 +395,7 @@ pub enum RouteKind {
 pub enum RouteSegment {
     Static(String),
     Dynamic(String),
+    CatchAll(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -407,9 +408,6 @@ pub struct RouteParam {
 pub enum DiscoverError {
     PagesDirectoryUnreadable {
         path: PathBuf,
-    },
-    UnsupportedCatchAll {
-        source_file: PathBuf,
     },
     InvalidPageModulePath {
         source_file: PathBuf,
@@ -472,11 +470,6 @@ impl fmt::Display for DiscoverError {
             DiscoverError::PagesDirectoryUnreadable { path } => {
                 write!(f, "could not read pages directory {}", path.display())
             }
-            DiscoverError::UnsupportedCatchAll { source_file } => write!(
-                f,
-                "unsupported catch-all page {}: all_.rs is reserved but not generated yet",
-                source_file.display()
-            ),
             DiscoverError::InvalidPageModulePath { source_file } => {
                 write!(f, "invalid page module path {}", source_file.display())
             }
@@ -905,6 +898,14 @@ fn percent_encode_function() -> String {
     encoded
 }
 
+fn percent_encode_path(value: &str) -> String {
+    value
+        .split('/')
+        .map(percent_encode)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn is_unreserved(byte: u8) -> bool {
     matches!(
         byte,
@@ -1118,32 +1119,8 @@ fn path_expression_from_template(path: &str) -> String {
     let template = path
         .split('/')
         .map(|segment| {
-            if let Some(param) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-                params.push(param.to_string());
-                "{}".to_string()
-            } else {
-                segment.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-
-    let encoded_params = params
-        .iter()
-        .map(|param| format!("percent_encode(&{param}.to_string())"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    format!("format!({template:?}, {encoded_params})")
-}
-
-fn typed_path_expression_from_template(path: &str, contract: &RouteContract) -> String {
-    let mut params = Vec::new();
-    let template = path
-        .split('/')
-        .map(|segment| {
-            if let Some(param) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-                params.push(param.to_string());
+            if let Some(param) = route_template_param(segment) {
+                params.push(param);
                 "{}".to_string()
             } else {
                 segment.to_string()
@@ -1155,19 +1132,76 @@ fn typed_path_expression_from_template(path: &str, contract: &RouteContract) -> 
     let encoded_params = params
         .iter()
         .map(|param| {
-            if let Some(field) = contract.fields.iter().find(|field| field.name == *param) {
-                format!(
-                    "percent_encode(&proute::IntoParam::<{}>::into_param({param}))",
-                    field.type_name
-                )
+            if param.catch_all {
+                format!("percent_encode_path(&{}.to_string())", param.name)
             } else {
-                format!("percent_encode(&{param}.to_string())")
+                format!("percent_encode(&{}.to_string())", param.name)
             }
         })
         .collect::<Vec<_>>()
         .join(", ");
 
     format!("format!({template:?}, {encoded_params})")
+}
+
+fn typed_path_expression_from_template(path: &str, contract: &RouteContract) -> String {
+    let mut params = Vec::new();
+    let template = path
+        .split('/')
+        .map(|segment| {
+            if let Some(param) = route_template_param(segment) {
+                params.push(param);
+                "{}".to_string()
+            } else {
+                segment.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let encoded_params = params
+        .iter()
+        .map(|param| {
+            let serialized = if let Some(field) = contract
+                .fields
+                .iter()
+                .find(|field| field.name == param.name)
+            {
+                format!(
+                    "proute::IntoParam::<{}>::into_param({})",
+                    field.type_name, param.name
+                )
+            } else {
+                format!("{}.to_string()", param.name)
+            };
+
+            if param.catch_all {
+                format!("percent_encode_path(&{serialized})")
+            } else {
+                format!("percent_encode(&{serialized})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("format!({template:?}, {encoded_params})")
+}
+
+struct TemplateParam {
+    name: String,
+    catch_all: bool,
+}
+
+fn route_template_param(segment: &str) -> Option<TemplateParam> {
+    let param = segment.strip_prefix('{')?.strip_suffix('}')?;
+    let (name, catch_all) = match param.strip_prefix('*') {
+        Some(name) => (name, true),
+        None => (param, false),
+    };
+    Some(TemplateParam {
+        name: name.to_string(),
+        catch_all,
+    })
 }
 
 fn prefixed_route_path(mount: &Mount, path: &str) -> Option<String> {
@@ -1251,12 +1285,6 @@ fn should_ignore_file(mount: &Mount, file: &StdPath) -> bool {
 fn route_from_file(mount: &Mount, source_file: &StdPath) -> Result<Route, DiscoverError> {
     let raw_segments = raw_segments(mount, source_file)?;
 
-    if raw_segments.iter().any(|segment| segment == "all_") {
-        return Err(DiscoverError::UnsupportedCatchAll {
-            source_file: source_file.to_path_buf(),
-        });
-    }
-
     validate_raw_segments(source_file, &raw_segments)?;
     validate_file_is_not_namespace_parent(source_file, &raw_segments)?;
 
@@ -1271,6 +1299,7 @@ fn route_from_file(mount: &Mount, source_file: &StdPath) -> Result<Route, Discov
 
     let endpoint = endpoint_for(&raw_segments);
     let route_segments = route_segments(&raw_segments, &endpoint);
+    validate_catch_all_position(source_file, &route_segments)?;
     let params = dynamic_params(&route_segments);
     validate_params(source_file, &params)?;
 
@@ -1371,10 +1400,33 @@ fn route_leaf_segment(segment: &str) -> RouteSegment {
 }
 
 fn route_segment(segment: &str) -> RouteSegment {
-    if let Some(param) = segment.strip_suffix('_') {
+    if segment == "all_" {
+        RouteSegment::CatchAll("all".to_string())
+    } else if let Some(param) = segment.strip_suffix('_') {
         RouteSegment::Dynamic(param.to_string())
     } else {
         RouteSegment::Static(segment.to_string())
+    }
+}
+
+fn validate_catch_all_position(
+    source_file: &StdPath,
+    segments: &[RouteSegment],
+) -> Result<(), DiscoverError> {
+    let Some(index) = segments
+        .iter()
+        .position(|segment| matches!(segment, RouteSegment::CatchAll(_)))
+    else {
+        return Ok(());
+    };
+
+    if index + 1 == segments.len() {
+        Ok(())
+    } else {
+        Err(DiscoverError::InvalidPageSegment {
+            source_file: source_file.to_path_buf(),
+            segment: "all_".to_string(),
+        })
     }
 }
 
@@ -1383,10 +1435,12 @@ fn route_kind(segments: &[RouteSegment]) -> RouteKind {
         return RouteKind::Home;
     }
 
-    if segments
-        .iter()
-        .any(|segment| matches!(segment, RouteSegment::Dynamic(_)))
-    {
+    if segments.iter().any(|segment| {
+        matches!(
+            segment,
+            RouteSegment::Dynamic(_) | RouteSegment::CatchAll(_)
+        )
+    }) {
         RouteKind::Dynamic
     } else {
         RouteKind::Static
@@ -1398,7 +1452,7 @@ fn dynamic_params(segments: &[RouteSegment]) -> Vec<RouteParam> {
         .iter()
         .filter_map(|segment| match segment {
             RouteSegment::Static(_) => None,
-            RouteSegment::Dynamic(name) => Some(RouteParam {
+            RouteSegment::Dynamic(name) | RouteSegment::CatchAll(name) => Some(RouteParam {
                 name: name.clone(),
                 type_name: "String".to_string(),
             }),
@@ -1425,6 +1479,7 @@ fn route_segment_path(segment: &RouteSegment) -> String {
     match segment {
         RouteSegment::Static(value) => value.clone(),
         RouteSegment::Dynamic(name) => format!("{{{name}}}"),
+        RouteSegment::CatchAll(name) => format!("{{*{name}}}"),
     }
 }
 
@@ -1590,7 +1645,11 @@ fn is_reserved_page_segment(raw_segments: &[String], index: usize) -> bool {
     match segment {
         "index" => !is_last,
         "show" => true,
-        segment if segment.ends_with('_') && is_last && segment != "not_found_" => true,
+        segment
+            if segment.ends_with('_') && is_last && !matches!(segment, "not_found_" | "all_") =>
+        {
+            true
+        }
         "create" | "update" | "delete" => !is_last,
         _ => false,
     }
@@ -2021,6 +2080,7 @@ fn comparable_route_key(route: &Route) -> (u8, String, HttpMethod, String) {
         .map(|segment| match segment {
             RouteSegment::Static(value) => format!("1:{value}"),
             RouteSegment::Dynamic(_) => "2:".to_string(),
+            RouteSegment::CatchAll(_) => "3:".to_string(),
         })
         .chain(std::iter::once("0".to_string()))
         .collect::<Vec<_>>()
@@ -2920,15 +2980,34 @@ pub(crate) async fn new(
     }
 
     #[test]
-    fn rejects_reserved_catch_all() {
+    fn generates_terminal_catch_all_routes() {
         let fixture = Fixture::new("catch_all");
         fixture.write("index.rs");
         fixture.write("not_found_.rs");
         fixture.write("docs/all_.rs");
 
-        let error = discover_mount(fixture.mount()).unwrap_err();
+        let routes = discover_mount(fixture.mount()).unwrap().routes;
+        let docs = routes
+            .iter()
+            .find(|route| route.name == "docs/all_")
+            .expect("catch-all route");
 
-        assert!(matches!(error, DiscoverError::UnsupportedCatchAll { .. }));
+        assert_eq!(docs.path, "/docs/{*all}");
+        assert_eq!(
+            docs.params,
+            vec![RouteParam {
+                name: "all".to_string(),
+                type_name: "String".to_string(),
+            }]
+        );
+
+        let generated = generate_mount_module(&MountRoutes {
+            mount: fixture.mount(),
+            routes,
+        });
+        assert!(generated.contains(r#"path: "/docs/{*all}""#));
+        assert!(generated.contains("pub fn docs_all_(all: impl std::fmt::Display) -> String"));
+        assert!(generated.contains("percent_encode_path(&all.to_string())"));
     }
 
     struct Fixture {
