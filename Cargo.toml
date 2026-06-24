@@ -12,3 +12,6 @@ syn = { version = "2", features = ["full"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }
+
+[profile.dev]
+debug = 1
