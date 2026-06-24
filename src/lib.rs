@@ -13,6 +13,8 @@ pub struct Mount {
     pub handler_name: String,
     pub handler_names: HandlerNames,
     pub router_state_type: Option<String>,
+    pub ignored_path_prefixes: Vec<PathBuf>,
+    pub include_prefixed_home_route: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +39,8 @@ impl Mount {
             handler_name: "handler".to_string(),
             handler_names: HandlerNames::Fixed("handler".to_string()),
             router_state_type: None,
+            ignored_path_prefixes: Vec::new(),
+            include_prefixed_home_route: true,
         }
     }
 
@@ -59,6 +63,19 @@ impl Mount {
 
     pub fn with_router_state_type(mut self, router_state_type: impl Into<String>) -> Self {
         self.router_state_type = Some(router_state_type.into());
+        self
+    }
+
+    pub fn with_ignored_path_prefixes(
+        mut self,
+        prefixes: impl IntoIterator<Item = impl Into<PathBuf>>,
+    ) -> Self {
+        self.ignored_path_prefixes = prefixes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn without_prefixed_home_route(mut self) -> Self {
+        self.include_prefixed_home_route = false;
         self
     }
 }
@@ -315,7 +332,7 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
     let mut routes = Vec::new();
 
     for file in files {
-        if should_ignore_file(&mount.pages, &file) {
+        if should_ignore_file(&mount, &file) {
             continue;
         }
 
@@ -714,6 +731,13 @@ fn route_groups(mount_routes: &MountRoutes, prefixed: bool) -> Vec<RouteGroup> {
     let mut groups: BTreeMap<String, Vec<Route>> = BTreeMap::new();
 
     for route in &mount_routes.routes {
+        if prefixed
+            && !mount_routes.mount.include_prefixed_home_route
+            && route.kind == RouteKind::Home
+        {
+            continue;
+        }
+
         let path = if prefixed {
             prefixed_route_path(&mount_routes.mount, &route.path)
                 .unwrap_or_else(|| route.path.clone())
@@ -1085,7 +1109,7 @@ fn walk_pages(root: &Path) -> Result<Vec<PathBuf>, DiscoverError> {
     Ok(paths)
 }
 
-fn should_ignore_file(root: &Path, file: &Path) -> bool {
+fn should_ignore_file(mount: &Mount, file: &Path) -> bool {
     if file.extension().is_none_or(|extension| extension != "rs") {
         return true;
     }
@@ -1094,7 +1118,19 @@ fn should_ignore_file(root: &Path, file: &Path) -> bool {
         return true;
     }
 
-    relative_parts(root, file).is_ok_and(|parts| parts.iter().any(|part| part == "shared"))
+    let Ok(relative) = file.strip_prefix(&mount.pages) else {
+        return true;
+    };
+
+    if mount
+        .ignored_path_prefixes
+        .iter()
+        .any(|prefix| relative.starts_with(prefix))
+    {
+        return true;
+    }
+
+    relative_parts(&mount.pages, file).is_ok_and(|parts| parts.iter().any(|part| part == "shared"))
 }
 
 fn route_from_file(mount: &Mount, source_file: &Path) -> Result<Route, DiscoverError> {
@@ -1631,7 +1667,7 @@ fn public_fn_declarations(source: &str) -> Vec<String> {
         }
 
         if current.is_empty() {
-            if !line.starts_with("pub") {
+            if !is_public_fn_declaration_start(&line) {
                 continue;
             }
             current.push_str(&line);
@@ -1651,6 +1687,13 @@ fn public_fn_declarations(source: &str) -> Vec<String> {
     }
 
     declarations
+}
+
+fn is_public_fn_declaration_start(line: &str) -> bool {
+    line.starts_with("pub(crate) async fn ")
+        || line.starts_with("pub(crate) fn ")
+        || line.starts_with("pub async fn ")
+        || line.starts_with("pub fn ")
 }
 
 fn strip_line_comment(line: &str) -> String {
@@ -2003,6 +2046,31 @@ mod tests {
     }
 
     #[test]
+    fn generated_prefixed_router_can_skip_home_route() {
+        let fixture = Fixture::new("generated_router_skips_prefixed_home");
+        fixture.write("index.rs");
+        fixture.write("cart/index.rs");
+
+        let mount_routes = discover_mount(
+            fixture
+                .mount()
+                .with_language_param("lang")
+                .with_router_state_type("crate::app::AppState")
+                .without_prefixed_home_route(),
+        )
+        .unwrap();
+        let generated = generate_mount_module(&mount_routes);
+
+        assert!(
+            generated.contains(".route(\"/\", axum::routing::get(crate::pages::index::handler))")
+        );
+        assert!(generated.contains(
+            ".route(\"/{lang}/cart\", axum::routing::get(crate::pages::cart::index::handler))"
+        ));
+        assert!(!generated.contains(".route(\"/{lang}\","));
+    }
+
+    #[test]
     fn write_mount_file_writes_under_routes_directory() {
         let fixture = Fixture::new("write_mount_file");
         fixture.write("index.rs");
@@ -2250,6 +2318,33 @@ pub(crate) async fn handler(
     }
 
     #[test]
+    fn ignores_public_struct_fields_when_validating_handlers() {
+        let fixture = Fixture::new("public_struct_fields_before_handler");
+        fixture.write_source("index.rs", "pub(crate) async fn index() {}\n");
+        fixture.write_source(
+            "orders/new.rs",
+            r#"
+pub(super) struct OrderForm {
+    pub(super) name: String,
+}
+
+pub(crate) async fn new(
+    state: (),
+) {
+}
+"#,
+        );
+
+        let routes = discover_mount(fixture.mount().with_route_action_handler_names())
+            .unwrap()
+            .routes;
+
+        assert!(routes.iter().any(|route| {
+            route.path == "/orders/new" && route.handler_path == "crate::pages::orders::new::new"
+        }));
+    }
+
+    #[test]
     fn rejects_duplicate_dynamic_route_patterns_for_same_method() {
         let fixture = Fixture::new("duplicate_patterns");
         fixture.write("index.rs");
@@ -2318,6 +2413,31 @@ pub(crate) async fn handler(
             .collect::<Vec<_>>();
 
         assert_eq!(paths, ["/", "/not_found"]);
+    }
+
+    #[test]
+    fn ignores_configured_path_prefixes() {
+        let fixture = Fixture::new("ignored_prefixes");
+        fixture.write("index.rs");
+        fixture.write("not_found_.rs");
+        fixture.write("cart/index.rs");
+        fixture.write("products/index.rs");
+        fixture.write("products/id_/index.rs");
+        fixture.write("content/articles/index.rs");
+
+        let routes = discover_mount(
+            fixture
+                .mount()
+                .with_ignored_path_prefixes(["products", "content"]),
+        )
+        .unwrap()
+        .routes;
+        let paths = routes
+            .iter()
+            .map(|route| route.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, ["/", "/cart", "/not_found"]);
     }
 
     #[test]
