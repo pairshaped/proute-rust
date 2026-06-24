@@ -1673,11 +1673,14 @@ fn has_public_handler(source: &str, handler_name: &str) -> bool {
             || declaration.starts_with(&format!("pub(crate) fn {handler_name}"))
             || declaration.starts_with(&format!("pub async fn {handler_name}"))
             || declaration.starts_with(&format!("pub fn {handler_name}"))
-            || declaration.starts_with(&format!("pub(crate) use "))
-                && declaration.ends_with(&format!("::{handler_name};"))
-            || declaration.starts_with(&format!("pub use "))
-                && declaration.ends_with(&format!("::{handler_name};"))
+            || is_public_handler_reexport(declaration, handler_name)
     })
+}
+
+fn is_public_handler_reexport(declaration: &str, handler_name: &str) -> bool {
+    (declaration.starts_with("pub(crate) use ") || declaration.starts_with("pub use "))
+        && (declaration.ends_with(&format!("::{handler_name};"))
+            || declaration.ends_with(&format!(" as {handler_name};")))
 }
 
 fn public_fn_declarations(source: &str) -> Vec<String> {
@@ -2294,7 +2297,7 @@ mod tests {
         );
         fixture.write_source(
             "orders/order_id_/update.rs",
-            "pub(crate) async fn update() {}\n",
+            "pub(crate) use super::index::action as update;\n",
         );
         fixture.write_source(
             "orders/order_id_/delete.rs",
