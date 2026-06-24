@@ -130,10 +130,11 @@ pub(crate) async fn index(
 
 When `RouteParams` exists, proute validates that its fields exactly match the
 dynamic path params for the route. The struct and fields must be `pub(crate)`
-or `pub` so generated helpers can use the same contract:
+or `pub` so generated helpers can use the same contract. Generated URL helpers
+take one typed argument per route param:
 
 ```rust
-routes::public::orders_order_id_(&RouteParams { order_id: 123 })
+routes::public::orders_order_id_(123)
 ```
 
 `proute::Path<T>` delegates to Axum's typed path deserializer and turns any path
@@ -141,10 +142,17 @@ deserialization failure into `404 Not Found`. A bad typed route param means the
 URL does not satisfy the route contract, so handlers do not need local parsing
 branches for route shape errors.
 
-Typed helpers serialize contract fields through `proute::ToParam`. Common
-primitive and string types are supported directly. App-specific route param
-types can implement `ToParam` when their URL form differs from their ordinary
-display form.
+Typed helpers serialize contract fields through `proute::IntoParam<T>`, where
+`T` is the field type from `RouteParams`. This keeps ids typed while allowing
+ergonomic string params:
+
+```rust
+routes::admin::products_product_type_("leagues")
+```
+
+Common primitive and string types are supported directly. App-specific route
+param types can implement `ToParam` when their URL form differs from their
+ordinary display form.
 
 ### Friendly URLs
 
@@ -157,11 +165,10 @@ pub(crate) struct RouteParams {
     pub(crate) order_id: proute::FriendlyId<i64>,
 }
 
-let params = RouteParams {
-    order_id: proute::FriendlyId::new(123, "Summer Curling Registration"),
-};
-
-routes::public::orders_order_id_(&params)
+routes::public::orders_order_id_(proute::FriendlyId::new(
+    123,
+    "Summer Curling Registration",
+))
 // /orders/123-summer-curling-registration
 ```
 
