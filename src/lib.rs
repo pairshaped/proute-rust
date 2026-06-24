@@ -1673,6 +1673,10 @@ fn has_public_handler(source: &str, handler_name: &str) -> bool {
             || declaration.starts_with(&format!("pub(crate) fn {handler_name}"))
             || declaration.starts_with(&format!("pub async fn {handler_name}"))
             || declaration.starts_with(&format!("pub fn {handler_name}"))
+            || declaration.starts_with(&format!("pub(crate) use "))
+                && declaration.ends_with(&format!("::{handler_name};"))
+            || declaration.starts_with(&format!("pub use "))
+                && declaration.ends_with(&format!("::{handler_name};"))
     })
 }
 
@@ -1690,7 +1694,7 @@ fn public_fn_declarations(source: &str) -> Vec<String> {
         }
 
         if current.is_empty() {
-            if !is_public_fn_declaration_start(&line) {
+            if !is_public_handler_declaration_start(&line) {
                 continue;
             }
             current.push_str(&line);
@@ -1712,11 +1716,13 @@ fn public_fn_declarations(source: &str) -> Vec<String> {
     declarations
 }
 
-fn is_public_fn_declaration_start(line: &str) -> bool {
+fn is_public_handler_declaration_start(line: &str) -> bool {
     line.starts_with("pub(crate) async fn ")
         || line.starts_with("pub(crate) fn ")
         || line.starts_with("pub async fn ")
         || line.starts_with("pub fn ")
+        || line.starts_with("pub(crate) use ")
+        || line.starts_with("pub use ")
 }
 
 fn strip_line_comment(line: &str) -> String {
@@ -2240,7 +2246,10 @@ mod tests {
         let fixture = Fixture::new("missing_handler");
         fixture.write("index.rs");
         fixture.write("not_found_.rs");
-        fixture.write_source("orders/index.rs", "pub(crate) async fn index() {}\n");
+        fixture.write_source(
+            "orders/index.rs",
+            "pub(crate) async fn index() {}\npub(crate) async fn export_csv() {}\npub(crate) async fn items_json() {}\n",
+        );
 
         let error = discover_mount(fixture.mount()).unwrap_err();
 
@@ -2291,8 +2300,14 @@ mod tests {
             "orders/order_id_/delete.rs",
             "pub(crate) async fn delete() {}\n",
         );
-        fixture.write_source("orders/export.rs", "pub(crate) async fn export_csv() {}\n");
-        fixture.write_source("orders/items.rs", "pub(crate) async fn items_json() {}\n");
+        fixture.write_source(
+            "orders/export.rs",
+            "pub(crate) use super::index::export_csv;\n",
+        );
+        fixture.write_source(
+            "orders/items.rs",
+            "pub(crate) use super::index::items_json;\n",
+        );
 
         let routes = discover_mount(fixture.mount().with_route_action_handler_names())
             .unwrap()
