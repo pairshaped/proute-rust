@@ -765,7 +765,7 @@ fn path_helper(route: &Route, helper_name: &str, path: &str) -> String {
 
     if route.params.is_empty() {
         format!(
-            "#[allow(non_snake_case)]\npub fn {helper_name}() -> &'static str {{\n    {path:?}\n}}\n"
+            "#[allow(non_snake_case)]\npub const fn {helper_name}() -> &'static str {{\n    {path:?}\n}}\n"
         )
     } else {
         let args = route_helper_params(route);
@@ -2627,7 +2627,7 @@ pub(crate) async fn new(
             .collect::<Vec<_>>();
 
         assert_eq!(route_paths, ["/"]);
-        assert!(generated.contains("pub fn home() -> &'static str"));
+        assert!(generated.contains("pub const fn home() -> &'static str"));
         assert!(!generated.contains("path: \"/not_found\""));
         assert!(!generated.contains(".route(\"/not_found\""));
     }
