@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::future::Future;
 use std::path::{Path as StdPath, PathBuf};
 use std::str::FromStr;
 
@@ -196,10 +195,10 @@ fn friendly_slug(value: &str, max_chars: usize) -> String {
     }
 
     let truncated = slug.chars().take(max_chars).collect::<String>();
-    if let Some((head, _)) = truncated.rsplit_once('-') {
-        if !head.is_empty() {
-            return head.to_string();
-        }
+    if let Some((head, _)) = truncated.rsplit_once('-')
+        && !head.is_empty()
+    {
+        return head.to_string();
     }
     truncated.trim_end_matches('-').to_string()
 }
@@ -222,16 +221,14 @@ where
 {
     type Rejection = axum::http::StatusCode;
 
-    fn from_request_parts(
+    async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         state: &S,
-    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        async move {
-            axum::extract::Path::<T>::from_request_parts(parts, state)
-                .await
-                .map(|axum::extract::Path(value)| Self(value))
-                .map_err(|_| axum::http::StatusCode::NOT_FOUND)
-        }
+    ) -> Result<Self, Self::Rejection> {
+        axum::extract::Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Path(value)| Self(value))
+            .map_err(|_| axum::http::StatusCode::NOT_FOUND)
     }
 }
 
@@ -703,13 +700,14 @@ pub fn generate_routes_mod_file(mount_routes: &[MountRoutes]) -> GeneratedFile {
 }
 
 pub fn generate_mount_module(mount_routes: &MountRoutes) -> String {
-    let mut sections = Vec::new();
-    sections.push(generated_header(mount_routes));
-    sections.push(route_spec_type());
-    sections.push(route_table(mount_routes));
-    sections.push(router_functions(mount_routes));
-    sections.push(path_helpers(mount_routes));
-    sections.push(percent_encode_function());
+    let sections = [
+        generated_header(mount_routes),
+        route_spec_type(),
+        route_table(mount_routes),
+        router_functions(mount_routes),
+        path_helpers(mount_routes),
+        percent_encode_function(),
+    ];
 
     sections.join("\n")
 }
