@@ -695,7 +695,7 @@ pub fn generate_routes_mod_file(mount_routes: &[MountRoutes]) -> GeneratedFile {
 
     GeneratedFile {
         path: PathBuf::from("proute").join("mod.rs"),
-        contents: format!("//// Generated. Do not edit.\n\n{modules}\n"),
+        contents: format!("// Generated. Do not edit.\n\n{modules}\n"),
     }
 }
 
@@ -714,7 +714,7 @@ pub fn generate_mount_module(mount_routes: &MountRoutes) -> String {
 
 fn generated_header(mount_routes: &MountRoutes) -> String {
     format!(
-        "//// Generated. Do not edit.\n////\n//// mount: {}\n//// pages: {}\n//// route_root: {}\n//// language_param: {}\n",
+        "// Generated. Do not edit.\n//\n// mount: {}\n// pages: {}\n// route_root: {}\n// language_param: {}\n",
         mount_routes.mount.name,
         mount_routes.mount.pages.display(),
         mount_routes.mount.route_root,
@@ -2195,7 +2195,11 @@ mod tests {
         let generated = generate_mount_file(&mount_routes);
 
         assert_eq!(generated.path, PathBuf::from("proute/public.rs"));
-        assert!(generated.contents.contains("//// mount: public"));
+        assert!(
+            generated
+                .contents
+                .starts_with("// Generated. Do not edit.\n//\n// mount: public\n")
+        );
         assert!(generated.contents.contains("pub const ROUTES"));
         assert!(
             generated
@@ -2635,7 +2639,7 @@ pub(crate) async fn handler() {}
         assert!(output_root.join("proute/admin.rs").exists());
         assert_eq!(
             fs::read_to_string(output_root.join("proute/mod.rs")).unwrap(),
-            "//// Generated. Do not edit.\n\npub mod public;\npub mod admin;\n"
+            "// Generated. Do not edit.\n\npub mod public;\npub mod admin;\n"
         );
     }
 
