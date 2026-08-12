@@ -177,6 +177,25 @@ On incoming requests, `FriendlyId<i64>` accepts `/orders/123` and
 `/orders/123-any-slug-text`. It parses only the leading `123`; bad leading ids
 fail extraction and become the standard proute 404 through `proute::Path<T>`.
 
+## Per-route body limits
+
+Applications can attach an Axum body limit while Proute discovers route source
+files:
+
+```rust
+fn upload_limit(source: &Path) -> Option<usize> {
+    source.ends_with("upload/create.rs").then_some(64 * 1024 * 1024)
+}
+
+let mount = Mount::new("public", "src/pages", "/", "crate::pages")
+    .with_body_limit_for_source(upload_limit);
+```
+
+Proute layers the limit on both canonical and language-prefixed forms of the
+route. Keep the callback narrow and application-owned. Ordinary routes should
+retain Axum's small default; only handlers that actually accept uploads should
+receive upload-sized limits.
+
 Friendly slug suffixes default to 60 characters. Generation lowercases ASCII
 text, turns separator runs into single hyphens, trims edge hyphens, and cuts at
 a word boundary when practical. Empty slugs fall back to the bare id. Routes

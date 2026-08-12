@@ -232,7 +232,7 @@ where
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Mount {
     pub name: String,
     pub pages: PathBuf,
@@ -244,6 +244,7 @@ pub struct Mount {
     pub router_state_type: Option<String>,
     pub ignored_path_prefixes: Vec<PathBuf>,
     pub include_prefixed_home_route: bool,
+    pub body_limit_for_source: Option<fn(&StdPath) -> Option<usize>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -270,6 +271,7 @@ impl Mount {
             router_state_type: None,
             ignored_path_prefixes: Vec::new(),
             include_prefixed_home_route: true,
+            body_limit_for_source: None,
         }
     }
 
@@ -307,9 +309,17 @@ impl Mount {
         self.include_prefixed_home_route = false;
         self
     }
+
+    pub fn with_body_limit_for_source(
+        mut self,
+        body_limit_for_source: fn(&StdPath) -> Option<usize>,
+    ) -> Self {
+        self.body_limit_for_source = Some(body_limit_for_source);
+        self
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct MountRoutes {
     pub mount: Mount,
     pub routes: Vec<Route>,
@@ -330,6 +340,7 @@ pub struct Route {
     pub handler_name: String,
     pub handler_path: String,
     pub contract: Option<RouteContract>,
+    pub body_limit: Option<usize>,
 }
 
 impl Route {
@@ -832,10 +843,19 @@ fn route_groups(mount_routes: &MountRoutes, prefixed: bool) -> Vec<RouteGroup> {
 }
 
 fn route_group_line(group: &RouteGroup) -> String {
+    let body_limit = group
+        .routes
+        .iter()
+        .filter_map(|route| route.body_limit)
+        .max();
+    let layer = body_limit.map_or_else(String::new, |limit| {
+        format!(".layer(axum::extract::DefaultBodyLimit::max({limit}))")
+    });
     format!(
-        ".route({:?}, {})",
+        ".route({:?}, {}{})",
         group.path,
-        method_router_expression(&group.routes)
+        method_router_expression(&group.routes),
+        layer,
     )
 }
 
@@ -1327,6 +1347,9 @@ fn route_from_file(mount: &Mount, source_file: &StdPath) -> Result<Route, Discov
         handler_path,
         name,
         contract,
+        body_limit: mount
+            .body_limit_for_source
+            .and_then(|body_limit| body_limit(source_file)),
     })
 }
 
@@ -1513,6 +1536,7 @@ fn not_found_route(mount: &Mount, source_file: &StdPath, module_path: String) ->
         handler_name,
         handler_path,
         contract: None,
+        body_limit: None,
     }
 }
 
@@ -2554,6 +2578,40 @@ pub(crate) async fn handler() {}
             generated
                 .contains(".route(\"/{lang}/orders\", axum::routing::get(crate::pages::orders::index::handler).post(crate::pages::orders::create::handler))")
         );
+    }
+
+    #[test]
+    fn generated_router_applies_body_limits_only_to_marked_routes() {
+        fn body_limit(source_file: &StdPath) -> Option<usize> {
+            source_file
+                .ends_with("uploads/create.rs")
+                .then_some(64 * 1024 * 1024)
+        }
+
+        let fixture = Fixture::new("generated_router_body_limits");
+        fixture.write("index.rs");
+        fixture.write("orders/create.rs");
+        fixture.write("uploads/create.rs");
+
+        let mount_routes = discover_mount(
+            fixture
+                .mount()
+                .with_language_param("lang")
+                .with_router_state_type("crate::app::AppState")
+                .with_body_limit_for_source(body_limit),
+        )
+        .unwrap();
+        let generated = generate_mount_module(&mount_routes);
+
+        assert!(generated.contains(
+            ".route(\"/uploads\", axum::routing::post(crate::pages::uploads::create::handler).layer(axum::extract::DefaultBodyLimit::max(67108864)))"
+        ));
+        assert!(generated.contains(
+            ".route(\"/{lang}/uploads\", axum::routing::post(crate::pages::uploads::create::handler).layer(axum::extract::DefaultBodyLimit::max(67108864)))"
+        ));
+        assert!(generated.contains(
+            ".route(\"/orders\", axum::routing::post(crate::pages::orders::create::handler))"
+        ));
     }
 
     #[test]
