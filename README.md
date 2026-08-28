@@ -5,6 +5,17 @@
 It follows the Elm Land and Gleam `proute` idea that the file path is the route,
 then adds a small server-side convention for HTTP mutation endpoints.
 
+## Public boundary
+
+The public Rust API in `src/lib.rs` owns mount configuration, route discovery,
+typed path extraction, friendly IDs, route-parameter conversion, and generated
+module output. Applications own their page modules, handler workflows, route
+authorization, and Axum state.
+
+This README is Proute's governing design record. The implementation is kept in
+one `src/lib.rs` module because discovery, validation, and emission form one
+workflow. There are no separate component ADRs.
+
 ## Route Convention
 
 ```text
@@ -251,3 +262,9 @@ pub fn prefixed_routes() -> axum::Router<crate::app::AppState>
 
 Generated path helpers percent-encode dynamic params, so a value like `a/b`
 is generated as `/orders/a%2Fb`.
+
+## Source ownership
+
+This monorepo is Proute's editable source of truth. A public repository may be
+derived with filtered history under the [repository export decision](../../docs/adr/0001-private-monorepo-and-public-library-exports.md),
+but changes come back through this directory.
