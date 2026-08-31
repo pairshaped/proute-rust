@@ -245,6 +245,7 @@ pub struct Mount {
     pub ignored_path_prefixes: Vec<PathBuf>,
     pub include_prefixed_home_route: bool,
     pub body_limit_for_source: Option<fn(&StdPath) -> Option<usize>>,
+    pub static_segment_paths: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -272,6 +273,7 @@ impl Mount {
             ignored_path_prefixes: Vec::new(),
             include_prefixed_home_route: true,
             body_limit_for_source: None,
+            static_segment_paths: BTreeMap::new(),
         }
     }
 
@@ -315,6 +317,16 @@ impl Mount {
         body_limit_for_source: fn(&StdPath) -> Option<usize>,
     ) -> Self {
         self.body_limit_for_source = Some(body_limit_for_source);
+        self
+    }
+
+    pub fn with_static_segment_path(
+        mut self,
+        module_segment: impl Into<String>,
+        path_segment: impl Into<String>,
+    ) -> Self {
+        self.static_segment_paths
+            .insert(module_segment.into(), path_segment.into());
         self
     }
 }
@@ -1316,7 +1328,7 @@ fn route_from_file(mount: &Mount, source_file: &StdPath) -> Result<Route, Discov
     }
 
     let endpoint = endpoint_for(&raw_segments);
-    let route_segments = route_segments(&raw_segments, &endpoint);
+    let route_segments = route_segments(mount, &raw_segments, &endpoint);
     validate_catch_all_position(source_file, &route_segments)?;
     let params = dynamic_params(&route_segments);
     validate_params(source_file, &params)?;
@@ -1386,7 +1398,11 @@ fn method_for(endpoint: &Endpoint) -> HttpMethod {
     }
 }
 
-fn route_segments(raw_segments: &[String], endpoint: &Endpoint) -> Vec<RouteSegment> {
+fn route_segments(
+    mount: &Mount,
+    raw_segments: &[String],
+    endpoint: &Endpoint,
+) -> Vec<RouteSegment> {
     let path_segments = match endpoint {
         Endpoint::Page => raw_segments,
         Endpoint::Action(Action::Create | Action::Update) => {
@@ -1403,10 +1419,20 @@ fn route_segments(raw_segments: &[String], endpoint: &Endpoint) -> Vec<RouteSegm
         .iter()
         .enumerate()
         .map(|(index, segment)| {
-            if index + 1 == path_segments.len() {
+            let segment = if index + 1 == path_segments.len() {
                 route_leaf_segment(segment)
             } else {
                 route_segment(segment)
+            };
+            match segment {
+                RouteSegment::Static(value) => RouteSegment::Static(
+                    mount
+                        .static_segment_paths
+                        .get(&value)
+                        .cloned()
+                        .unwrap_or(value),
+                ),
+                segment => segment,
             }
         })
         .collect()
@@ -2205,6 +2231,24 @@ mod tests {
                 "GET /admin/games/{id} crate::pages::admin::games::id_::index",
                 "GET /admin/not_found crate::pages::admin::not_found_",
             ]
+        );
+    }
+
+    #[test]
+    fn maps_a_static_module_segment_to_a_different_url_segment() {
+        let fixture = Fixture::new("static_segment_path");
+        fixture.write("settings/accounting_codes/index.rs");
+
+        let mount = fixture
+            .mount()
+            .with_static_segment_path("accounting_codes", "accounting-codes");
+        let route = discover_mount(mount).unwrap().routes.remove(0);
+
+        assert_eq!(route.path, "/settings/accounting-codes");
+        assert_eq!(route.helper_name, "settings_accounting_codes");
+        assert_eq!(
+            route.module_path,
+            "crate::pages::settings::accounting_codes::index"
         );
     }
 

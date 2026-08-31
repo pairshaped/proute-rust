@@ -52,6 +52,14 @@ Rules:
   both would match the same path shape. Static siblings are checked first and
   may live beside one dynamic fallback.
 
+When a URL needs punctuation that is not valid in a Rust module name, configure
+that static segment on the mount. Module and helper names keep the Rust segment:
+
+```rust
+Mount::new("admin", "src/pages/admin", "/admin", "crate::pages::admin")
+    .with_static_segment_path("accounting_codes", "accounting-codes");
+```
+
 ## Generated Layout
 
 The generated app code lives under `proute`:
