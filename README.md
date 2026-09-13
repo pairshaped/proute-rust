@@ -12,9 +12,10 @@ typed path extraction, friendly IDs, route-parameter conversion, and generated
 module output. Applications own their page modules, handler workflows, route
 authorization, and Axum state.
 
-This README is Proute's governing design record. The implementation is kept in
-one `src/lib.rs` module because discovery, validation, and emission form one
-workflow. There are no separate component ADRs.
+The [route-source decision](docs/adr/0001-file-routes-and-generated-contracts.md)
+records the boundary and conventions. The implementation is kept in one
+`src/lib.rs` module because discovery, validation, and emission form one
+workflow.
 
 ## Route Convention
 
