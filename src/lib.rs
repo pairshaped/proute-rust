@@ -1293,7 +1293,10 @@ fn should_ignore_file(mount: &Mount, file: &StdPath) -> bool {
         return true;
     }
 
-    if file.file_name().is_some_and(|name| name == "mod.rs") {
+    if file
+        .file_name()
+        .is_some_and(|name| name == "mod.rs" || name == "tests.rs")
+    {
         return true;
     }
 
@@ -2205,6 +2208,17 @@ mod tests {
                 "GET /not_found not_found_ crate::pages::not_found_",
             ]
         );
+    }
+
+    #[test]
+    fn ignores_test_modules_in_page_directories() {
+        let fixture = Fixture::new("test_modules");
+        fixture.write("orders/index.rs");
+        fixture.write_source("orders/tests.rs", "#[test]\nfn order_test() {}\n");
+
+        let routes = discover_mount(fixture.mount()).unwrap().routes;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].name, "orders");
     }
 
     #[test]

@@ -13,6 +13,7 @@ Directories ending in an underscore define dynamic path segments. A terminal
 `all_.rs` defines a catch-all, and an optional `not_found_.rs` defines the
 mount's 404 route. Discovery rejects ambiguous dynamic siblings and route
 files that also act as namespace parents.
+`mod.rs` and `tests.rs` are Rust module structure, not routes.
 
 Mount configuration owns URL prefixes, language prefixes, static URL spellings
 that differ from Rust module names, handler naming, Axum state, and narrow
