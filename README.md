@@ -17,6 +17,35 @@ records the boundary and conventions. The implementation is kept in one
 `src/lib.rs` module because discovery, validation, and emission form one
 workflow.
 
+## Generated operations
+
+A mount can declare a small allowlist of socket operations next to its route
+configuration. Proute generates the socket route, a stable path constant and
+typed dispatch. It checks duplicate identities and that each declared handler
+exists in the stated source file. Rust compilation checks the request and
+response types against the handler. A declaration does not grant access to a
+page handler by name or URL.
+
+```rust
+Mount::new("public", "src/pages/public", "/", "crate::pages::public")
+    .with_router_state_type("crate::app::AppState")
+    .with_operation_context_type("crate::pages::public::shared::operation_socket::OperationContext")
+    .with_operation_socket("/operations/live", "crate::pages::public::shared::operation_socket::index")
+    .with_operation(proute::Operation::new(
+        "publicRouteLoad",
+        "crate::islands::contracts::public_app::PublicRouteLoadRequest",
+        "crate::islands::contracts::public_app::PublicDocument",
+        "crate::pages::public::shared::operation_socket::route_load",
+        "shared/operation_socket.rs",
+    ));
+```
+
+The application owns the socket handler, authentication, per-message authority
+checks, request and response structs, and operation code. Pass only data that
+the handler is authorized to use. Generate the browser contract from the same
+mount declaration and verify both directions with serialized fixtures. The
+optional Hypertea socket transport handles client correlation and cleanup.
+
 ## Route Convention
 
 ```text

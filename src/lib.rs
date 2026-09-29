@@ -246,6 +246,42 @@ pub struct Mount {
     pub include_prefixed_home_route: bool,
     pub body_limit_for_source: Option<fn(&StdPath) -> Option<usize>>,
     pub static_segment_paths: BTreeMap<String, String>,
+    pub operations: Vec<Operation>,
+    pub operation_context_type: Option<String>,
+    pub operation_socket: Option<OperationSocket>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Operation {
+    pub identity: String,
+    pub request_type: String,
+    pub response_type: String,
+    pub handler_path: String,
+    pub source_file: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationSocket {
+    pub path: String,
+    pub handler_path: String,
+}
+
+impl Operation {
+    pub fn new(
+        identity: impl Into<String>,
+        request_type: impl Into<String>,
+        response_type: impl Into<String>,
+        handler_path: impl Into<String>,
+        source_file: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            identity: identity.into(),
+            request_type: request_type.into(),
+            response_type: response_type.into(),
+            handler_path: handler_path.into(),
+            source_file: source_file.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -274,6 +310,9 @@ impl Mount {
             include_prefixed_home_route: true,
             body_limit_for_source: None,
             static_segment_paths: BTreeMap::new(),
+            operations: Vec::new(),
+            operation_context_type: None,
+            operation_socket: None,
         }
     }
 
@@ -327,6 +366,28 @@ impl Mount {
     ) -> Self {
         self.static_segment_paths
             .insert(module_segment.into(), path_segment.into());
+        self
+    }
+
+    pub fn with_operation(mut self, operation: Operation) -> Self {
+        self.operations.push(operation);
+        self
+    }
+
+    pub fn with_operation_context_type(mut self, context_type: impl Into<String>) -> Self {
+        self.operation_context_type = Some(context_type.into());
+        self
+    }
+
+    pub fn with_operation_socket(
+        mut self,
+        path: impl Into<String>,
+        handler_path: impl Into<String>,
+    ) -> Self {
+        self.operation_socket = Some(OperationSocket {
+            path: path.into(),
+            handler_path: handler_path.into(),
+        });
         self
     }
 }
@@ -471,6 +532,12 @@ pub enum DiscoverError {
     InvalidMountName {
         mount_name: String,
     },
+    InvalidOperation {
+        identity: String,
+    },
+    DuplicateOperation {
+        identity: String,
+    },
     PageFileUnreadable {
         source_file: PathBuf,
     },
@@ -560,6 +627,12 @@ impl fmt::Display for DiscoverError {
             DiscoverError::InvalidMountName { mount_name } => {
                 write!(f, "invalid mount name {mount_name:?}")
             }
+            DiscoverError::InvalidOperation { identity } => {
+                write!(f, "invalid operation {identity:?}")
+            }
+            DiscoverError::DuplicateOperation { identity } => {
+                write!(f, "duplicate operation {identity:?}")
+            }
             DiscoverError::PageFileUnreadable { source_file } => {
                 write!(f, "could not read page file {}", source_file.display())
             }
@@ -597,6 +670,60 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
             name: mount.handler_name.clone(),
         });
     }
+    let mut identities = BTreeSet::new();
+    let has_socket = mount.operation_socket.is_some();
+    let has_operations = !mount.operations.is_empty();
+    if has_socket != has_operations
+        || (mount.operation_socket.is_some() && mount.router_state_type.is_none())
+    {
+        return Err(DiscoverError::InvalidOperation {
+            identity: "socket_configuration".to_string(),
+        });
+    }
+    if let Some(socket) = &mount.operation_socket
+        && (!socket.path.starts_with('/')
+            || socket.path.contains('{')
+            || socket.path.contains('?')
+            || syn::parse_str::<syn::Path>(&socket.handler_path).is_err())
+    {
+        return Err(DiscoverError::InvalidOperation {
+            identity: "socket_path".to_string(),
+        });
+    }
+    if !mount.operations.is_empty()
+        && mount
+            .operation_context_type
+            .as_deref()
+            .is_none_or(|name| syn::parse_str::<syn::Type>(name).is_err())
+    {
+        return Err(DiscoverError::InvalidOperation {
+            identity: "context_type".to_string(),
+        });
+    }
+    for operation in &mount.operations {
+        if !operation
+            .identity
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase())
+            || !operation
+                .identity
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric())
+            || syn::parse_str::<syn::Type>(&operation.request_type).is_err()
+            || syn::parse_str::<syn::Type>(&operation.response_type).is_err()
+            || syn::parse_str::<syn::Path>(&operation.handler_path).is_err()
+        {
+            return Err(DiscoverError::InvalidOperation {
+                identity: operation.identity.clone(),
+            });
+        }
+        if !identities.insert(&operation.identity) {
+            return Err(DiscoverError::DuplicateOperation {
+                identity: operation.identity.clone(),
+            });
+        }
+    }
 
     let files = walk_pages(&mount.pages)?;
     let mut routes = Vec::new();
@@ -610,9 +737,34 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
     }
 
     reject_duplicate_routes(&routes)?;
+    if let Some(socket) = &mount.operation_socket
+        && routes.iter().any(|route| route.path == socket.path)
+    {
+        return Err(DiscoverError::InvalidOperation {
+            identity: "socket_path".to_string(),
+        });
+    }
     reject_duplicate_names(&routes)?;
     reject_duplicate_helpers(&routes)?;
     validate_handlers(&routes)?;
+    for operation in &mount.operations {
+        let source_file = mount.pages.join(&operation.source_file);
+        let source =
+            fs::read_to_string(&source_file).map_err(|_| DiscoverError::PageFileUnreadable {
+                source_file: source_file.clone(),
+            })?;
+        let handler_name = operation
+            .handler_path
+            .rsplit("::")
+            .next()
+            .expect("validated handler path");
+        if !has_public_handler(&source, handler_name) {
+            return Err(DiscoverError::MissingHandler {
+                source_file,
+                handler_name: handler_name.to_string(),
+            });
+        }
+    }
     routes.sort_by(route_sort_key);
 
     Ok(MountRoutes { mount, routes })
@@ -727,12 +879,102 @@ pub fn generate_mount_module(mount_routes: &MountRoutes) -> String {
         generated_header(mount_routes),
         route_spec_type(),
         route_table(mount_routes),
+        operation_dispatch(mount_routes),
         router_functions(mount_routes),
         path_helpers(mount_routes),
         percent_encode_function(),
     ];
 
     sections.join("\n")
+}
+
+#[cfg(test)]
+mod operation_tests {
+    use super::*;
+
+    #[test]
+    fn generated_dispatch_has_one_typed_allowlist_and_rejects_duplicate_identity() {
+        let directory =
+            std::env::temp_dir().join(format!("proute-operations-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("index.rs"),
+            "pub async fn handler() {}\npub async fn route_load() {}\n",
+        )
+        .unwrap();
+        let operation = Operation::new(
+            "routeLoad",
+            "crate::Request",
+            "crate::Response",
+            "crate::route_load",
+            "index.rs",
+        );
+        let mount = Mount::new("public", &directory, "/", "crate::pages")
+            .with_router_state_type("crate::State")
+            .with_operation_context_type("crate::Context")
+            .with_operation_socket("/operations/live", "crate::socket")
+            .with_operation(operation.clone());
+        let routes = discover_mount(mount.clone()).unwrap();
+        let source = generate_mount_module(&routes);
+        assert!(source.contains("\"routeLoad\" =>"));
+        assert!(source.contains("let request: crate::Request = serde_json::from_value(payload)"));
+        assert!(source.contains("_ => Err(\"unknown_operation\")"));
+        assert!(source.contains("pub const OPERATION_SOCKET_PATH: &str = \"/operations/live\""));
+        assert!(source.contains(".route(\"/operations/live\", axum::routing::get(crate::socket))"));
+        assert!(
+            matches!(discover_mount(mount.with_operation(operation)), Err(DiscoverError::DuplicateOperation { identity }) if identity == "routeLoad")
+        );
+        let missing = Mount::new("public", &directory, "/", "crate::pages")
+            .with_router_state_type("crate::State")
+            .with_operation_context_type("crate::Context")
+            .with_operation_socket("/operations/live", "crate::socket")
+            .with_operation(Operation::new(
+                "missing",
+                "crate::Request",
+                "crate::Response",
+                "crate::missing",
+                "index.rs",
+            ));
+        assert!(
+            matches!(discover_mount(missing), Err(DiscoverError::MissingHandler { handler_name, .. }) if handler_name == "missing")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+fn operation_dispatch(mount_routes: &MountRoutes) -> String {
+    if mount_routes.mount.operations.is_empty() {
+        return String::new();
+    }
+    let arms = mount_routes.mount.operations.iter().map(|operation| {
+        format!(
+            "{identity:?} => {{ let request: {request_type} = serde_json::from_value(payload).map_err(|_| \"invalid_request\")?; let response: {response_type} = {handler_path}(context, request).await.map_err(|_| \"handler_failed\")?; serde_json::to_value(response).map_err(|_| \"invalid_response\") }},",
+            identity = operation.identity,
+            request_type = operation.request_type,
+            response_type = operation.response_type,
+            handler_path = operation.handler_path,
+        )
+    }).collect::<Vec<_>>().join("\n");
+    let context_type = mount_routes
+        .mount
+        .operation_context_type
+        .as_deref()
+        .expect("validated operation context");
+    let socket_path = mount_routes
+        .mount
+        .operation_socket
+        .as_ref()
+        .map(|socket| {
+            format!(
+                "pub const OPERATION_SOCKET_PATH: &str = {:?};\n",
+                socket.path
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "{socket_path}pub async fn dispatch_operation(context: &{context_type}, operation: &str, payload: serde_json::Value) -> Result<serde_json::Value, &'static str> {{\n    match operation {{\n{}\n        _ => Err(\"unknown_operation\"),\n    }}\n}}\n",
+        indent_lines(&arms, 8)
+    )
 }
 
 fn generated_header(mount_routes: &MountRoutes) -> String {
@@ -794,7 +1036,12 @@ fn router_functions(mount_routes: &MountRoutes) -> String {
         return String::new();
     };
 
-    let canonical = router_function("routes", state_type, &route_groups(mount_routes, false));
+    let canonical = router_function(
+        "routes",
+        state_type,
+        &route_groups(mount_routes, false),
+        mount_routes.mount.operation_socket.as_ref(),
+    );
     if mount_routes.mount.language_param.is_none() {
         return canonical;
     }
@@ -803,17 +1050,26 @@ fn router_functions(mount_routes: &MountRoutes) -> String {
         "prefixed_routes",
         state_type,
         &route_groups(mount_routes, true),
+        None,
     );
 
     format!("{canonical}\n{prefixed}")
 }
 
-fn router_function(name: &str, state_type: &str, groups: &[RouteGroup]) -> String {
-    let routes = groups
-        .iter()
-        .map(route_group_line)
-        .collect::<Vec<_>>()
-        .join("\n");
+fn router_function(
+    name: &str,
+    state_type: &str,
+    groups: &[RouteGroup],
+    operation_socket: Option<&OperationSocket>,
+) -> String {
+    let mut routes = groups.iter().map(route_group_line).collect::<Vec<_>>();
+    if let Some(socket) = operation_socket {
+        routes.push(format!(
+            ".route({:?}, axum::routing::get({}))",
+            socket.path, socket.handler_path
+        ));
+    }
+    let routes = routes.join("\n");
 
     format!(
         "pub fn {name}() -> axum::Router<{state_type}> {{\n    axum::Router::new()\n{}\n}}\n",
