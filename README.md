@@ -310,6 +310,7 @@ its runtime routing to that owner's generated module:
 Mount::new("admin", "src/pages/admin", "/admin", "crate::pages::admin")
     .with_route_action_handler_names()
     .with_router_state_type("crate::app::AppState")
+    .with_ignored_path_prefixes(["lib.rs", "generated"])
     .with_feature_source("features/resources/src", "resources", "settings/resources", "resources")
 ```
 
