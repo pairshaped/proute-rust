@@ -301,6 +301,37 @@ pub fn prefixed_routes() -> axum::Router<crate::app::AppState>
 Generated path helpers percent-encode dynamic params, so a value like `a/b`
 is generated as `/orders/a%2Fb`.
 
+## Feature-owned routers
+
+A mount can discover another source owner with a logical route prefix and delegate
+its runtime routing to that owner's generated module:
+
+```rust
+Mount::new("admin", "src/pages/admin", "/admin", "crate::pages::admin")
+    .with_route_action_handler_names()
+    .with_router_state_type("crate::app::AppState")
+    .with_feature_source("features/resources/src", "resources", "settings/resources", "resources")
+```
+
+The feature's `reorder/update.rs` retains the route identity
+`settings/resources/reorder/update` and URL `/admin/settings/resources/reorder`.
+Its Rust handler path remains `resources::reorder::update::update`. Discovery
+checks collisions across all sources before generation. The application module
+keeps the combined facts and helpers, while its router merges the feature's
+`routes` and, for localized mounts, `prefixed_routes` functions.
+
+Use `generate_router_module` for runtime-only owner output. A feature can generate
+generic router functions with `with_generic_router_state("S", ["support::State"])`.
+The generated bounds require `S: Clone + Send + Sync + 'static` and
+`support::State: axum::extract::FromRef<S>`, so the feature need not import the
+application's state type. `with_route_prefix` applies a logical prefix to an
+individual mount without changing physical module paths. Source-owner prefixes
+participate in paths, names and helpers.
+
+Applications own staging, multi-owner publication, freshness and middleware
+composition. Generating a router delegate does not validate a separate inventory;
+use the already validated combined discovery result to select that owner's routes.
+
 ## Source ownership
 
 This monorepo is Proute's editable source of truth. A public repository may be

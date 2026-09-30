@@ -239,6 +239,8 @@ pub struct Mount {
     pub route_root: String,
     pub module_root: String,
     pub additional_sources: Vec<RouteSource>,
+    pub route_prefix: Vec<String>,
+    pub router_state_extractions: Option<Vec<String>>,
     pub language_param: Option<String>,
     pub handler_name: String,
     pub handler_names: HandlerNames,
@@ -256,6 +258,8 @@ pub struct Mount {
 pub struct RouteSource {
     pub pages: PathBuf,
     pub module_root: String,
+    pub route_prefix: Vec<String>,
+    pub router_module: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -310,6 +314,8 @@ impl Mount {
             route_root: route_root.into(),
             module_root: module_root.into(),
             additional_sources: Vec::new(),
+            route_prefix: Vec::new(),
+            router_state_extractions: None,
             language_param: None,
             handler_name: "handler".to_string(),
             handler_names: HandlerNames::Fixed("handler".to_string()),
@@ -332,7 +338,40 @@ impl Mount {
         self.additional_sources.push(RouteSource {
             pages: pages.into(),
             module_root: module_root.into(),
+            route_prefix: Vec::new(),
+            router_module: None,
         });
+        self
+    }
+
+    pub fn with_route_prefix(mut self, prefix: &str) -> Self {
+        self.route_prefix = prefix.split('/').map(str::to_string).collect();
+        self
+    }
+
+    pub fn with_feature_source(
+        mut self,
+        pages: impl Into<PathBuf>,
+        module_root: impl Into<String>,
+        route_prefix: &str,
+        router_module: impl Into<String>,
+    ) -> Self {
+        self.additional_sources.push(RouteSource {
+            pages: pages.into(),
+            module_root: module_root.into(),
+            route_prefix: route_prefix.split('/').map(str::to_string).collect(),
+            router_module: Some(router_module.into()),
+        });
+        self
+    }
+
+    pub fn with_generic_router_state(
+        mut self,
+        parameter: impl Into<String>,
+        extractions: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.router_state_type = Some(parameter.into());
+        self.router_state_extractions = Some(extractions.into_iter().map(Into::into).collect());
         self
     }
 
@@ -355,6 +394,7 @@ impl Mount {
 
     pub fn with_router_state_type(mut self, router_state_type: impl Into<String>) -> Self {
         self.router_state_type = Some(router_state_type.into());
+        self.router_state_extractions = None;
         self
     }
 
@@ -690,6 +730,19 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
             name: mount.handler_name.clone(),
         });
     }
+    if let Some(extractions) = &mount.router_state_extractions
+        && (mount
+            .router_state_type
+            .as_deref()
+            .is_none_or(|name| syn::parse_str::<syn::Ident>(name).is_err())
+            || extractions
+                .iter()
+                .any(|ty| syn::parse_str::<syn::Type>(ty).is_err()))
+    {
+        return Err(DiscoverError::InvalidPageModulePath {
+            source_file: mount.pages.clone(),
+        });
+    }
     let mut identities = BTreeSet::new();
     let has_socket = mount.operation_socket.is_some();
     let has_operations = !mount.operations.is_empty();
@@ -749,12 +802,23 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
     let sources = std::iter::once(RouteSource {
         pages: mount.pages.clone(),
         module_root: mount.module_root.clone(),
+        route_prefix: mount.route_prefix.clone(),
+        router_module: None,
     })
     .chain(mount.additional_sources.iter().cloned());
     for source in sources {
         let mut source_mount = mount.clone();
         source_mount.pages = source.pages;
         source_mount.module_root = source.module_root;
+        source_mount.route_prefix = source.route_prefix;
+        validate_raw_segments(&source_mount.pages, &source_mount.route_prefix)?;
+        if let Some(router_module) = source.router_module
+            && syn::parse_str::<syn::Path>(&router_module).is_err()
+        {
+            return Err(DiscoverError::InvalidPageModulePath {
+                source_file: source_mount.pages,
+            });
+        }
         for file in walk_pages(&source_mount.pages)? {
             if should_ignore_file(&source_mount, &file) {
                 continue;
@@ -915,6 +979,15 @@ pub fn generate_mount_module(mount_routes: &MountRoutes) -> String {
     sections.join("\n")
 }
 
+/// Emits only runtime router functions for an independently compiled owner.
+pub fn generate_router_module(mount_routes: &MountRoutes) -> String {
+    format!(
+        "{}\n{}",
+        generated_header(mount_routes),
+        router_functions(mount_routes)
+    )
+}
+
 #[cfg(test)]
 mod operation_tests {
     use super::*;
@@ -1063,11 +1136,25 @@ fn router_functions(mount_routes: &MountRoutes) -> String {
         return String::new();
     };
 
+    let mut owned = mount_routes.clone();
+    owned.routes.retain(|route| {
+        !mount_routes.mount.additional_sources.iter().any(|source| {
+            source.router_module.is_some() && route.source_file.starts_with(&source.pages)
+        })
+    });
+    let delegates = mount_routes
+        .mount
+        .additional_sources
+        .iter()
+        .filter_map(|source| source.router_module.as_deref())
+        .collect::<Vec<_>>();
     let canonical = router_function(
         "routes",
         state_type,
-        &route_groups(mount_routes, false),
+        &route_groups(&owned, false),
         mount_routes.mount.operation_socket.as_ref(),
+        mount_routes.mount.router_state_extractions.as_deref(),
+        &delegates,
     );
     if mount_routes.mount.language_param.is_none() {
         return canonical;
@@ -1076,8 +1163,10 @@ fn router_functions(mount_routes: &MountRoutes) -> String {
     let prefixed = router_function(
         "prefixed_routes",
         state_type,
-        &route_groups(mount_routes, true),
+        &route_groups(&owned, true),
         None,
+        mount_routes.mount.router_state_extractions.as_deref(),
+        &delegates,
     );
 
     format!("{canonical}\n{prefixed}")
@@ -1088,6 +1177,8 @@ fn router_function(
     state_type: &str,
     groups: &[RouteGroup],
     operation_socket: Option<&OperationSocket>,
+    extractions: Option<&[String]>,
+    delegates: &[&str],
 ) -> String {
     let mut routes = groups.iter().map(route_group_line).collect::<Vec<_>>();
     if let Some(socket) = operation_socket {
@@ -1096,10 +1187,28 @@ fn router_function(
             socket.path, socket.handler_path
         ));
     }
+    routes.extend(
+        delegates
+            .iter()
+            .map(|module| format!(".merge({module}::{name}())")),
+    );
     let routes = routes.join("\n");
-
+    let (generics, bounds) = if let Some(extractions) = extractions {
+        let mut bounds = vec![format!("{state_type}: Clone + Send + Sync + 'static")];
+        bounds.extend(
+            extractions
+                .iter()
+                .map(|ty| format!("{ty}: axum::extract::FromRef<{state_type}>")),
+        );
+        (
+            format!("<{state_type}>"),
+            format!(" where {}", bounds.join(", ")),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     format!(
-        "pub fn {name}() -> axum::Router<{state_type}> {{\n    axum::Router::new()\n{}\n}}\n",
+        "pub fn {name}{generics}() -> axum::Router<{state_type}>{bounds} {{\n    axum::Router::new()\n{}\n}}\n",
         indent_lines(&routes, 8)
     )
 }
@@ -1658,7 +1767,7 @@ fn raw_segments(mount: &Mount, source_file: &StdPath) -> Result<Vec<String>, Dis
         }
     })?;
 
-    let mut segments = Vec::new();
+    let mut segments = mount.route_prefix.clone();
     for component in relative.components() {
         let segment = component.as_os_str().to_string_lossy();
         let segment = segment.strip_suffix(".rs").unwrap_or(&segment);
@@ -2502,6 +2611,77 @@ mod tests {
         let routes = discover_mount(fixture.mount()).unwrap().routes;
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].name, "orders");
+    }
+
+    #[test]
+    fn feature_sources_keep_logical_identity_and_delegate_routers() {
+        let app = Fixture::new("feature_owner_app");
+        app.write_source("settings/index.rs", "pub async fn index() {}\n");
+        let feature = Fixture::new("feature_owner_source");
+        feature.write_source("reorder/update.rs", "pub async fn update() {}\n");
+        let mount = Mount::new("admin", &app.pages, "/admin", "crate::pages::admin")
+            .with_language_param("lang")
+            .with_route_action_handler_names()
+            .with_router_state_type("crate::AppState")
+            .with_feature_source(
+                &feature.pages,
+                "admin_resources",
+                "settings/resources",
+                "admin_resources",
+            );
+        let discovered = discover_mount(mount.clone()).unwrap();
+        let route = discovered
+            .routes
+            .iter()
+            .find(|route| route.name == "settings/resources/reorder/update")
+            .unwrap();
+        assert_eq!(route.path, "/admin/settings/resources/reorder");
+        assert_eq!(
+            route.handler_path,
+            "admin_resources::reorder::update::update"
+        );
+        assert_eq!(route.helper_name, "settings_resources_reorder_update");
+        let output = generate_mount_module(&discovered);
+        syn::parse_file(&output).unwrap();
+        assert!(output.contains(".merge(admin_resources::routes())"));
+        assert!(output.contains(".merge(admin_resources::prefixed_routes())"));
+        assert!(!output.contains("axum::routing::post(admin_resources::reorder"));
+        assert!(output.contains("localized_settings_resources_reorder_update"));
+        app.write_source(
+            "settings/resources/reorder/update.rs",
+            "pub async fn update() {}\n",
+        );
+        assert!(matches!(
+            discover_mount(mount),
+            Err(DiscoverError::DuplicateRoute { .. })
+        ));
+        let invalid = Mount::new("admin", &app.pages, "/admin", "crate::pages")
+            .with_feature_source(
+                &feature.pages,
+                "admin_resources",
+                "../resources",
+                "admin_resources",
+            );
+        assert!(discover_mount(invalid).is_err());
+    }
+
+    #[test]
+    fn generic_router_state_keeps_feature_independent() {
+        let feature = Fixture::new("generic_feature_state");
+        feature.write_source("reorder/update.rs", "pub async fn update() {}\n");
+        let mount = Mount::new("resources", &feature.pages, "/admin", "crate")
+            .with_route_prefix("settings/resources")
+            .with_language_param("lang")
+            .with_route_action_handler_names()
+            .with_generic_router_state("S", ["support::AdminSupport"]);
+        let routes = discover_mount(mount).unwrap();
+        let output = generate_router_module(&routes);
+        syn::parse_file(&output).unwrap();
+        assert!(output.contains("pub fn routes<S>() -> axum::Router<S>"));
+        assert!(output.contains("support::AdminSupport: axum::extract::FromRef<S>"));
+        assert!(output.contains("/admin/settings/resources/reorder"));
+        assert!(!output.contains("AppState"));
+        assert!(!output.contains("pub const ROUTES"));
     }
 
     #[test]
