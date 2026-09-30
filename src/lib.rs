@@ -238,6 +238,7 @@ pub struct Mount {
     pub pages: PathBuf,
     pub route_root: String,
     pub module_root: String,
+    pub additional_sources: Vec<RouteSource>,
     pub language_param: Option<String>,
     pub handler_name: String,
     pub handler_names: HandlerNames,
@@ -249,6 +250,12 @@ pub struct Mount {
     pub operations: Vec<Operation>,
     pub operation_context_type: Option<String>,
     pub operation_socket: Option<OperationSocket>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteSource {
+    pub pages: PathBuf,
+    pub module_root: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -302,6 +309,7 @@ impl Mount {
             pages: pages.into(),
             route_root: route_root.into(),
             module_root: module_root.into(),
+            additional_sources: Vec::new(),
             language_param: None,
             handler_name: "handler".to_string(),
             handler_names: HandlerNames::Fixed("handler".to_string()),
@@ -314,6 +322,18 @@ impl Mount {
             operation_context_type: None,
             operation_socket: None,
         }
+    }
+
+    pub fn with_source_root(
+        mut self,
+        pages: impl Into<PathBuf>,
+        module_root: impl Into<String>,
+    ) -> Self {
+        self.additional_sources.push(RouteSource {
+            pages: pages.into(),
+            module_root: module_root.into(),
+        });
+        self
     }
 
     pub fn with_language_param(mut self, language_param: impl Into<String>) -> Self {
@@ -725,15 +745,22 @@ pub fn discover_mount(mount: Mount) -> Result<MountRoutes, DiscoverError> {
         }
     }
 
-    let files = walk_pages(&mount.pages)?;
     let mut routes = Vec::new();
-
-    for file in files {
-        if should_ignore_file(&mount, &file) {
-            continue;
+    let sources = std::iter::once(RouteSource {
+        pages: mount.pages.clone(),
+        module_root: mount.module_root.clone(),
+    })
+    .chain(mount.additional_sources.iter().cloned());
+    for source in sources {
+        let mut source_mount = mount.clone();
+        source_mount.pages = source.pages;
+        source_mount.module_root = source.module_root;
+        for file in walk_pages(&source_mount.pages)? {
+            if should_ignore_file(&source_mount, &file) {
+                continue;
+            }
+            routes.push(route_from_file(&source_mount, &file)?);
         }
-
-        routes.push(route_from_file(&mount, &file)?);
     }
 
     reject_duplicate_routes(&routes)?;
@@ -2475,6 +2502,71 @@ mod tests {
         let routes = discover_mount(fixture.mount()).unwrap().routes;
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].name, "orders");
+    }
+
+    #[test]
+    fn multi_source_mount_preserves_logical_routes() {
+        let app = Fixture::new("multi_source_app");
+        app.write_source("settings/index.rs", "pub async fn index() {}\n");
+        let feature = Fixture::new("multi_source_feature");
+        feature.write_source(
+            "settings/resources/reorder/update.rs",
+            "pub async fn update() {}\n",
+        );
+        let mount = Mount::new("admin", &app.pages, "/admin", "crate::pages::admin")
+            .with_language_param("lang")
+            .with_route_action_handler_names()
+            .with_router_state_type("crate::AppState")
+            .with_source_root(&feature.pages, "admin_resources::pages");
+        let discovered = discover_mount(mount).expect("discover both owners");
+        assert_eq!(discovered.routes.len(), 2);
+        let reorder = discovered
+            .routes
+            .iter()
+            .find(|route| route.method == HttpMethod::Post)
+            .unwrap();
+        assert_eq!(reorder.path, "/admin/settings/resources/reorder");
+        assert_eq!(
+            reorder.handler_path,
+            "admin_resources::pages::settings::resources::reorder::update::update"
+        );
+        assert_eq!(reorder.helper_name, "settings_resources_reorder_update");
+        let generated = generate_mount_module(&discovered);
+        assert!(generated.contains("/{lang}/admin/settings/resources/reorder"));
+        assert!(generated.contains("axum::Router<crate::AppState>"));
+    }
+
+    #[test]
+    fn multi_source_mount_rejects_collisions_and_unreadable_roots() {
+        let app = Fixture::new("multi_source_collision_app");
+        let feature = Fixture::new("multi_source_collision_feature");
+        app.write_source("orders/id_/index.rs", "pub async fn index() {}\n");
+        feature.write_source("orders/slug_/index.rs", "pub async fn index() {}\n");
+        let mount = Mount::new("admin", &app.pages, "/admin", "crate::pages::admin")
+            .with_route_action_handler_names()
+            .with_source_root(&feature.pages, "admin_resources::pages");
+        assert!(
+            matches!(discover_mount(mount), Err(DiscoverError::DuplicateRoute { path, .. }) if path == "/admin/orders/{_}")
+        );
+
+        let app = Fixture::new("multi_source_helper_app");
+        let feature = Fixture::new("multi_source_helper_feature");
+        app.write_source("foo/bar/index.rs", "pub async fn index() {}\n");
+        feature.write_source("foo_bar/index.rs", "pub async fn index() {}\n");
+        let mount = Mount::new("admin", &app.pages, "/admin", "crate::pages::admin")
+            .with_route_action_handler_names()
+            .with_source_root(&feature.pages, "admin_resources::pages");
+        assert!(
+            matches!(discover_mount(mount), Err(DiscoverError::DuplicateHelper { helper, .. }) if helper == "foo_bar")
+        );
+
+        let missing = feature.root.join("missing");
+        let mount = Mount::new("admin", &app.pages, "/admin", "crate::pages::admin")
+            .with_route_action_handler_names()
+            .with_source_root(&missing, "admin_resources::pages");
+        assert!(
+            matches!(discover_mount(mount), Err(DiscoverError::PagesDirectoryUnreadable { path }) if path == missing)
+        );
     }
 
     #[test]
