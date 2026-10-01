@@ -335,6 +335,7 @@ use the already validated combined discovery result to select that owner's route
 
 ## Source ownership
 
-This monorepo is Proute's editable source of truth. A public repository may be
-derived with filtered history under the [repository export decision](../../docs/adr/0001-private-monorepo-and-public-library-exports.md),
-but changes come back through this directory.
+[The sports monorepo](https://github.com/pairshaped/sports) is Proute's editable
+source of truth. This public repository receives one-way exports of its source
+and relevant history. Development happens in the monorepo; the public export
+isn't maintained separately.
